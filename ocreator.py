@@ -1115,7 +1115,7 @@ TEMPLATE = r"""
 
     async function saveOC(silent) {
       if (!silent) {
-        setStatus('Saving...');
+        setSaveStatus('Saving...');
       }
       const payload = collectPayload();
       const res = await fetch(`/oc/${OC_ID}/save`, {
@@ -1135,7 +1135,7 @@ TEMPLATE = r"""
       const stamp = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       setSaveStatus(`Autosaved at ${stamp}`);
       if (!silent) {
-        setStatus('Saved.');
+        setSaveStatus('Saved.');
       }
     }
 
@@ -1161,8 +1161,8 @@ TEMPLATE = r"""
     }
 
     async function generateOC() {
-      setStatus('Generating...');
       await saveOC();
+      setStatus('Generating...');
       const res = await fetch(`/oc/${OC_ID}/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1419,7 +1419,8 @@ TEMPLATE = r"""
 
 def main() -> None:
     ensure_dirs()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8934")), debug=False)
+    ## this is just so its not on exactly 8000 :)
 
 
 if __name__ == "__main__":
