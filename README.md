@@ -39,3 +39,9 @@ Notes:
 
 ## License
 See `LICENSE`.
+
+## Notes
+
+the readme was done by AI, i am a little chud and didnt want to write it myself as you can see by emdashes :)
+also to clarify cause i dont say it a lot
+i build the shell of the project, Codex and so on decorates it so its visually appealing (cause i dont know a lot of HTML) :]
