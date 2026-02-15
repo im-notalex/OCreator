@@ -12,6 +12,7 @@ APP_TITLE = "OCreator"
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DB_PATH = DATA_DIR / "ocs.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
+PROVIDERS_PATH = DATA_DIR / "providers.json"
 
 PROVIDERS = [
     {"id": "openai", "label": "OpenAI"},
@@ -69,6 +70,18 @@ DEFAULT_OC = {
     "custom_template": "",
     "result_text": "",
     "updated_at": "",
+    "pinned": False,
+}
+
+DEFAULT_PROVIDER_PROFILE = {
+    "id": "",
+    "name": "",
+    "provider": "openai",
+    "model": "",
+    "base_url": "",
+    "api_key": "",
+    "notes": "",
+    "updated_at": "",
 }
 
 app = Flask(__name__)
@@ -121,6 +134,27 @@ def save_settings(settings: Dict[str, Any]) -> None:
     save_json(SETTINGS_PATH, settings)
 
 
+def load_provider_profiles() -> List[Dict[str, Any]]:
+    raw = load_json(PROVIDERS_PATH, {"providers": []})
+    items = raw.get("providers", []) if isinstance(raw, dict) else []
+    if not isinstance(items, list):
+        return []
+    profiles: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        profile = DEFAULT_PROVIDER_PROFILE.copy()
+        profile.update(item)
+        if not profile.get("id"):
+            profile["id"] = uuid.uuid4().hex[:10]
+        profiles.append(profile)
+    return profiles
+
+
+def save_provider_profiles(profiles: List[Dict[str, Any]]) -> None:
+    save_json(PROVIDERS_PATH, {"providers": profiles})
+
+
 def load_db() -> Dict[str, Any]:
     db = load_json(DB_PATH, {"ocs": []})
     if "ocs" not in db or not isinstance(db["ocs"], list):
@@ -135,7 +169,16 @@ def save_db(db: Dict[str, Any]) -> None:
 def ensure_oc_defaults(oc: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in DEFAULT_OC.items():
         oc.setdefault(key, value)
+    oc["pinned"] = bool(oc.get("pinned", False))
     return oc
+
+
+def sort_ocs(ocs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized = [ensure_oc_defaults(oc) for oc in ocs]
+    pinned = [oc for oc in normalized if oc.get("pinned")]
+    unpinned = [oc for oc in normalized if not oc.get("pinned")]
+    pinned.sort(key=lambda oc: (str(oc.get("name") or "Untitled OC").strip().lower(), oc.get("id", "")))
+    return pinned + unpinned
 
 
 def get_oc(db: Dict[str, Any], oc_id: str) -> Optional[Dict[str, Any]]:
@@ -298,7 +341,8 @@ def index():
         oc = create_oc(db)
         save_db(db)
         return redirect(url_for("edit_oc", oc_id=oc["id"]))
-    return redirect(url_for("edit_oc", oc_id=db["ocs"][0]["id"]))
+    sorted_ocs = sort_ocs(db["ocs"])
+    return redirect(url_for("edit_oc", oc_id=sorted_ocs[0]["id"]))
 
 
 @app.route("/oc/<oc_id>")
@@ -310,13 +354,17 @@ def edit_oc(oc_id: str):
         oc = create_oc(db)
         save_db(db)
     settings = load_settings()
+    provider_profiles = load_provider_profiles()
+    sorted_ocs = sort_ocs(db["ocs"])
     return render_template_string(
         TEMPLATE,
         app_title=APP_TITLE,
         oc=oc,
-        ocs=db["ocs"],
+        ocs=sorted_ocs,
         settings=settings,
         providers=PROVIDERS,
+        provider_profiles=provider_profiles,
+        provider_defaults=PROVIDER_DEFAULTS,
         default_template=DEFAULT_TEMPLATE,
     )
 
@@ -333,6 +381,57 @@ def create_oc_route():
     oc = create_oc(db)
     save_db(db)
     return redirect(url_for("edit_oc", oc_id=oc["id"]))
+
+
+@app.route("/oc/<oc_id>/duplicate", methods=["POST"])
+def duplicate_oc_route(oc_id: str):
+    ensure_dirs()
+    db = load_db()
+    source = get_oc(db, oc_id)
+    if not source:
+        return jsonify({"error": "OC not found"}), 404
+    duplicate = DEFAULT_OC.copy()
+    duplicate.update({k: v for k, v in source.items() if k in DEFAULT_OC})
+    duplicate["id"] = uuid.uuid4().hex[:10]
+    duplicate["name"] = f"{source.get('name') or 'Untitled OC'} (Copy)"
+    duplicate["pinned"] = False
+    duplicate["updated_at"] = now_iso()
+    db["ocs"].append(duplicate)
+    save_db(db)
+    return jsonify({"ok": True, "oc_id": duplicate["id"]})
+
+
+@app.route("/oc/<oc_id>/pin", methods=["POST"])
+def pin_oc_route(oc_id: str):
+    ensure_dirs()
+    db = load_db()
+    oc = get_oc(db, oc_id)
+    if not oc:
+        return jsonify({"error": "OC not found"}), 404
+    payload = request.get_json(silent=True) or {}
+    if "pinned" in payload:
+        oc["pinned"] = bool(payload.get("pinned"))
+    else:
+        oc["pinned"] = not bool(oc.get("pinned", False))
+    oc["updated_at"] = now_iso()
+    save_db(db)
+    return jsonify({"ok": True, "pinned": oc["pinned"]})
+
+
+@app.route("/oc/<oc_id>/delete", methods=["POST"])
+def delete_oc_route(oc_id: str):
+    ensure_dirs()
+    db = load_db()
+    before = len(db.get("ocs", []))
+    db["ocs"] = [oc for oc in db.get("ocs", []) if oc.get("id") != oc_id]
+    if len(db["ocs"]) == before:
+        return jsonify({"error": "OC not found"}), 404
+    if not db["ocs"]:
+        create_oc(db)
+    sorted_ocs = sort_ocs(db["ocs"])
+    next_id = sorted_ocs[0]["id"]
+    save_db(db)
+    return jsonify({"ok": True, "next_oc_id": next_id})
 
 
 @app.route("/oc/<oc_id>/save", methods=["POST"])
@@ -386,6 +485,47 @@ def generate_oc(oc_id: str):
     oc["updated_at"] = now_iso()
     save_db(db)
     return jsonify({"result": response, "name": oc.get("name", "")})
+
+
+@app.route("/providers/save", methods=["POST"])
+def save_provider_profile_route():
+    ensure_dirs()
+    payload = request.get_json(silent=True) or {}
+    profile_id = str(payload.get("id", "")).strip()
+    profiles = load_provider_profiles()
+    provider = str(payload.get("provider") or "openai").strip()
+    defaults = PROVIDER_DEFAULTS.get(provider, PROVIDER_DEFAULTS["openai"])
+    profile = {
+        "id": profile_id or uuid.uuid4().hex[:10],
+        "name": str(payload.get("name", "")).strip() or "Unnamed Provider",
+        "provider": provider,
+        "model": str(payload.get("model", "")).strip() or defaults["model"],
+        "base_url": str(payload.get("base_url", "")).strip() or defaults["base_url"],
+        "api_key": str(payload.get("api_key", "")).strip(),
+        "notes": str(payload.get("notes", "")).strip(),
+        "updated_at": now_iso(),
+    }
+    replaced = False
+    for i, existing in enumerate(profiles):
+        if existing.get("id") == profile["id"]:
+            profiles[i] = profile
+            replaced = True
+            break
+    if not replaced:
+        profiles.append(profile)
+    save_provider_profiles(profiles)
+    return jsonify({"ok": True, "profile": profile})
+
+
+@app.route("/providers/<profile_id>", methods=["DELETE"])
+def delete_provider_profile_route(profile_id: str):
+    ensure_dirs()
+    profiles = load_provider_profiles()
+    new_profiles = [item for item in profiles if item.get("id") != profile_id]
+    if len(new_profiles) == len(profiles):
+        return jsonify({"error": "Provider profile not found"}), 404
+    save_provider_profiles(new_profiles)
+    return jsonify({"ok": True})
 
 
 @app.route("/settings", methods=["POST"])
@@ -492,6 +632,55 @@ TEMPLATE = r"""
       background: linear-gradient(120deg, rgba(8, 10, 16, 0.92), rgba(10, 14, 22, 0.86));
       backdrop-filter: blur(20px);
     }
+    .fx-layer {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      overflow: hidden;
+      z-index: 1;
+    }
+    .fx-dot, .fx-comet, .fx-spark {
+      position: absolute;
+      border-radius: 999px;
+      opacity: 0;
+      will-change: transform, opacity;
+    }
+    .fx-dot {
+      width: 3px;
+      height: 3px;
+      background: var(--fx-dot, rgba(255, 255, 255, 0.75));
+      box-shadow: 0 0 10px var(--fx-dot-glow, rgba(255, 255, 255, 0.45));
+      animation: fx-twinkle 7s linear infinite;
+    }
+    .fx-comet {
+      width: 120px;
+      height: 2px;
+      background: linear-gradient(90deg, rgba(255, 255, 255, 0), var(--fx-comet, rgba(255, 175, 72, 0.95)), rgba(255, 255, 255, 0));
+      filter: drop-shadow(0 0 8px var(--fx-comet-glow, rgba(255, 174, 66, 0.55)));
+      animation: fx-comet 8s linear infinite;
+    }
+    .fx-spark {
+      width: 2px;
+      height: 2px;
+      background: var(--fx-spark, rgba(255, 225, 170, 0.9));
+      box-shadow: 0 0 8px var(--fx-spark-glow, rgba(255, 196, 112, 0.5));
+      animation: fx-float 6s ease-in-out infinite;
+    }
+    @keyframes fx-twinkle {
+      0%, 100% { opacity: 0.1; transform: translateY(0) scale(0.8); }
+      50% { opacity: 0.85; transform: translateY(-6px) scale(1.2); }
+    }
+    @keyframes fx-float {
+      0%, 100% { opacity: 0; transform: translate3d(0, 0, 0); }
+      25% { opacity: 0.8; }
+      75% { opacity: 0.4; transform: translate3d(16px, -22px, 0); }
+    }
+    @keyframes fx-comet {
+      0% { opacity: 0; transform: translate3d(-15vw, -5vh, 0) rotate(-18deg); }
+      8% { opacity: 0.95; }
+      35% { opacity: 0.8; transform: translate3d(40vw, 18vh, 0) rotate(-18deg); }
+      100% { opacity: 0; transform: translate3d(120vw, 58vh, 0) rotate(-18deg); }
+    }
     .brand {
       font-family: "Space Grotesk", "Manrope", sans-serif;
       font-size: 22px;
@@ -534,9 +723,11 @@ TEMPLATE = r"""
     }
     .layout {
       display: grid;
-      grid-template-columns: 320px 1fr 280px;
+      grid-template-columns: 300px 1fr 290px 320px;
       gap: 20px;
       padding: 24px;
+      position: relative;
+      z-index: 2;
     }
     .panel {
       background: var(--card);
@@ -544,6 +735,14 @@ TEMPLATE = r"""
       border-radius: var(--radius);
       padding: 16px;
       box-shadow: 0 14px 30px var(--shadow);
+      animation: panel-rise 420ms ease both;
+    }
+    .layout > .panel:nth-child(2) { animation-delay: 70ms; }
+    .layout > .panel:nth-child(3) { animation-delay: 140ms; }
+    .layout > .panel:nth-child(4) { animation-delay: 210ms; }
+    @keyframes panel-rise {
+      from { opacity: 0; transform: translateY(12px) scale(0.99); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
     }
     .panel h3, .panel h2 { margin: 0 0 10px; font-family: "Space Grotesk", sans-serif; }
     .list {
@@ -554,23 +753,95 @@ TEMPLATE = r"""
       overflow: auto;
     }
     .oc-card {
-      text-decoration: none;
-      color: var(--ink);
+      position: relative;
       padding: 12px;
       border-radius: 14px;
       border: 1px solid var(--border);
       background: var(--surface);
-      transition: transform 0.2s ease, border 0.2s ease;
+      transition: transform 0.24s ease, border 0.24s ease, box-shadow 0.24s ease;
+      z-index: 1;
     }
+    .oc-card.menu-open { z-index: 30; }
     .oc-card:hover { transform: translateY(-2px); }
     .oc-card.active {
       border-color: var(--accent);
       box-shadow: 0 10px 18px rgba(31, 191, 147, 0.2);
     }
+    .oc-link {
+      text-decoration: none;
+      color: var(--ink);
+      display: block;
+      padding-right: 34px;
+    }
+    .oc-card .title { font-weight: 700; }
+    .oc-card.pinned .title::before {
+      content: "Pinned • ";
+      color: var(--accent);
+      font-weight: 700;
+    }
     .oc-card .meta {
       font-size: 12px;
       color: var(--muted);
     }
+    .oc-menu-wrap {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+    }
+    .oc-menu-btn {
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.02);
+      color: var(--muted);
+      width: 28px;
+      height: 28px;
+      border-radius: 9px;
+      cursor: pointer;
+      display: grid;
+      place-items: center;
+      transition: border-color 0.2s ease, color 0.2s ease, transform 0.2s ease;
+      font-size: 16px;
+      line-height: 1;
+    }
+    .oc-menu-btn:hover {
+      border-color: var(--accent);
+      color: var(--ink);
+      transform: translateY(-1px);
+    }
+    .oc-menu {
+      position: absolute;
+      top: 32px;
+      right: 0;
+      width: 156px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--card);
+      box-shadow: 0 12px 22px var(--shadow);
+      display: none;
+      overflow: hidden;
+      transform: translateY(6px) scale(0.98);
+      transform-origin: top right;
+      opacity: 0;
+      transition: opacity 0.18s ease, transform 0.18s ease;
+      z-index: 50;
+    }
+    .oc-menu.open {
+      display: block;
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+    .oc-menu button {
+      width: 100%;
+      border: none;
+      background: transparent;
+      color: var(--ink);
+      text-align: left;
+      padding: 9px 11px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 13px;
+    }
+    .oc-menu button:hover { background: var(--soft); }
+    .oc-menu button[data-action="delete"] { color: #fb7185; }
     label {
       font-size: 11px;
       text-transform: uppercase;
@@ -634,6 +905,7 @@ TEMPLATE = r"""
       display: flex;
       align-items: center;
       gap: 12px;
+      position: relative;
     }
     .theme-picker {
       display: flex;
@@ -678,7 +950,75 @@ TEMPLATE = r"""
     .theme-swatch[data-theme="plasma"] { background: linear-gradient(120deg, #ec4899, #f59e0b); }
     .theme-swatch[data-theme="meteor"] { background: linear-gradient(120deg, #f97316, #22d3ee); }
     .theme-select { display: none; }
+    .effects-menu-btn {
+      border: 1px solid var(--border);
+      background: var(--soft);
+      color: var(--muted);
+      border-radius: 10px;
+      padding: 7px 10px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .effects-panel {
+      position: absolute;
+      right: 0;
+      top: 42px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      min-width: 220px;
+      padding: 12px;
+      box-shadow: 0 14px 28px var(--shadow);
+      display: none;
+      z-index: 60;
+    }
+    .effects-panel.open { display: block; }
+    .effects-line {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .effects-line input { width: auto; }
     .hint { font-size: 12px; color: var(--muted); }
+    .provider-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 12px;
+      max-height: 38vh;
+      overflow: auto;
+    }
+    .provider-card {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+      padding: 10px;
+      display: grid;
+      gap: 8px;
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+    .provider-card:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 16px rgba(0, 0, 0, 0.2);
+    }
+    .provider-card .meta {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .provider-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .provider-row .btn {
+      box-shadow: none;
+      padding: 7px 10px;
+      font-size: 12px;
+    }
     .modal {
       position: fixed;
       inset: 0;
@@ -688,7 +1028,11 @@ TEMPLATE = r"""
       background: rgba(8, 10, 15, 0.6);
       z-index: 50;
     }
-    .modal.open { display: flex; }
+    .modal.open { display: flex; animation: fade-in 200ms ease both; }
+    @keyframes fade-in {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
     .modal-card {
       width: min(980px, 92vw);
       max-height: 90vh;
@@ -699,6 +1043,11 @@ TEMPLATE = r"""
       padding: 20px;
       box-shadow: 0 20px 40px var(--shadow);
       position: relative;
+      animation: modal-rise 220ms ease both;
+    }
+    @keyframes modal-rise {
+      from { opacity: 0; transform: translateY(16px) scale(0.99); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
     }
     .help-grid {
       display: grid;
@@ -788,17 +1137,30 @@ TEMPLATE = r"""
       background: linear-gradient(120deg, var(--accent), var(--accent-2));
       transition: width 0.3s ease;
     }
+    @media (max-width: 1600px) {
+      .layout { grid-template-columns: 280px 1fr 300px; }
+      .layout .panel.provider-panel { grid-column: 1 / -1; }
+    }
     @media (max-width: 1200px) {
       .layout { grid-template-columns: 280px 1fr; }
       .layout .panel.library-panel { order: 3; }
+      .layout .panel.provider-panel { order: 4; grid-column: 1 / -1; }
     }
     @media (max-width: 980px) {
       .layout { grid-template-columns: 1fr; }
       .help-grid { grid-template-columns: 1fr; }
+      .layout .panel.provider-panel { grid-column: auto; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        animation: none !important;
+        transition: none !important;
+      }
     }
   </style>
 </head>
 <body>
+  <div id="fx_layer" class="fx-layer" aria-hidden="true"></div>
   <header>
     <div>
       <div class="brand">{{ app_title }}</div>
@@ -840,6 +1202,14 @@ TEMPLATE = r"""
           <option value="plasma">Plasma</option>
           <option value="meteor">Meteor</option>
         </select>
+        <button class="effects-menu-btn" id="effects_menu_btn" type="button">Effects</button>
+        <div class="effects-panel" id="effects_panel">
+          <div class="effects-line">
+            <span>Theme effects</span>
+            <input id="effects_enabled" type="checkbox" checked />
+          </div>
+          <div class="hint" style="margin-top: 8px;">Warm themes use comets and sparks. Cool themes use stars.</div>
+        </div>
       </div>
       <button class="btn ghost" type="button" onclick="toggleOnboard(true)">Guide</button>
       <button class="btn ghost help-btn" type="button" onclick="toggleHelp(true)" title="Help">?</button>
@@ -961,10 +1331,75 @@ TEMPLATE = r"""
       <h3>OC Library</h3>
       <div class="list" style="margin-bottom: 16px;">
         {% for item in ocs %}
-        <a class="oc-card {% if item.id == oc.id %}active{% endif %}" href="{{ url_for('edit_oc', oc_id=item.id) }}">
-          <div class="title">{{ item.name or 'Untitled OC' }}</div>
-          <div class="meta">{{ item.updated_at or 'New' }}</div>
-        </a>
+        <div class="oc-card {% if item.id == oc.id %}active{% endif %} {% if item.pinned %}pinned{% endif %}" data-oc-id="{{ item.id }}">
+          <a class="oc-link" href="{{ url_for('edit_oc', oc_id=item.id) }}">
+            <div class="title">{{ item.name or 'Untitled OC' }}</div>
+            <div class="meta">{{ item.updated_at or 'New' }}</div>
+          </a>
+          <div class="oc-menu-wrap">
+            <button class="oc-menu-btn" type="button" title="OC actions" data-menu-trigger aria-label="Open OC menu">☰</button>
+            <div class="oc-menu" data-menu>
+              <button type="button" data-action="duplicate">Duplicate</button>
+              <button type="button" data-action="pin">{% if item.pinned %}Unpin{% else %}Pin{% endif %}</button>
+              <button type="button" data-action="delete">Delete</button>
+            </div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </aside>
+
+    <aside class="panel provider-panel">
+      <h3>Provider Vault</h3>
+      <div class="grid">
+        <input type="hidden" id="vault_id" />
+        <div>
+          <label>Profile Name</label>
+          <input id="vault_name" placeholder="My OpenRouter Key" />
+        </div>
+        <div>
+          <label>Provider</label>
+          <select id="vault_provider">
+            {% for provider in providers %}
+            <option value="{{ provider.id }}">{{ provider.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>Model</label>
+          <input id="vault_model" placeholder="Model override (optional)" />
+        </div>
+        <div>
+          <label>Base URL</label>
+          <input id="vault_base_url" placeholder="Base URL override (optional)" />
+        </div>
+        <div>
+          <label>API Key</label>
+          <input id="vault_key" type="password" placeholder="Stored in data/providers.json" />
+        </div>
+        <div>
+          <label>Notes</label>
+          <input id="vault_notes" placeholder="Optional notes" />
+        </div>
+      </div>
+      <div class="row" style="margin-top: 10px;">
+        <button class="btn ghost" type="button" onclick="saveProviderProfile()">Save Profile</button>
+        <button class="btn ghost" type="button" onclick="clearProviderForm()">Clear</button>
+      </div>
+      <div class="hint" id="provider_status" style="margin-top: 8px;">Profiles are saved to data/providers.json.</div>
+      <div class="provider-list" id="provider_list">
+        {% for profile in provider_profiles %}
+        <div class="provider-card" data-profile-id="{{ profile.id }}">
+          <div>
+            <strong>{{ profile.name or 'Unnamed Provider' }}</strong>
+            <div class="meta">{{ profile.provider }}{% if profile.model %} • {{ profile.model }}{% endif %}</div>
+          </div>
+          <div class="provider-row">
+            <button class="btn ghost" type="button" onclick="useProviderProfile('{{ profile.id }}')">Use</button>
+            <button class="btn ghost" type="button" onclick="editProviderProfile('{{ profile.id }}')">Edit</button>
+            <button class="btn ghost" type="button" onclick="deleteProviderProfile('{{ profile.id }}')">Delete</button>
+          </div>
+        </div>
         {% endfor %}
       </div>
     </aside>
@@ -1054,6 +1489,10 @@ TEMPLATE = r"""
     const helpStatusHintEl = document.getElementById('help_status_hint');
     const themeSelect = document.getElementById('theme_select');
     const themeButtons = document.querySelectorAll('.theme-option');
+    const fxLayerEl = document.getElementById('fx_layer');
+    const effectsMenuBtnEl = document.getElementById('effects_menu_btn');
+    const effectsPanelEl = document.getElementById('effects_panel');
+    const effectsEnabledEl = document.getElementById('effects_enabled');
     const onboardModalEl = document.getElementById('onboard_modal');
     const onboardProgressEl = document.getElementById('onboard_progress');
     const onboardStepTitleEl = document.getElementById('onboard_step_title');
@@ -1061,10 +1500,16 @@ TEMPLATE = r"""
     const onboardStepCountEl = document.getElementById('onboard_step_count');
     const onboardNextBtnEl = document.getElementById('onboard_next_btn');
     const onboardBackBtnEl = document.getElementById('onboard_back_btn');
+    const providerStatusEl = document.getElementById('provider_status');
+    const providerDefaults = {{ provider_defaults|tojson }};
+    const providerProfiles = {{ provider_profiles|tojson }};
 
     const HELP_HISTORY_KEY = 'ocreator_help_history';
     const HELP_MODE_KEY = 'ocreator_help_mode';
     const HELP_MODEL_KEY = 'ocreator_help_model';
+    const EFFECTS_ENABLED_KEY = 'ocreator_effects_enabled';
+
+    let activeThemeName = 'system';
 
     const ONBOARD_STEPS = [
       { title: 'Pick a mode', body: 'Create for new characters, Modify for cleanup, Enhance for targeted improvements.' },
@@ -1160,6 +1605,177 @@ TEMPLATE = r"""
       setStatus('Settings saved.');
     }
 
+    function setProviderStatus(text) {
+      if (providerStatusEl) providerStatusEl.textContent = text;
+    }
+
+    function fillProviderForm(profile) {
+      document.getElementById('vault_id').value = profile.id || '';
+      document.getElementById('vault_name').value = profile.name || '';
+      document.getElementById('vault_provider').value = profile.provider || 'openai';
+      document.getElementById('vault_model').value = profile.model || '';
+      document.getElementById('vault_base_url').value = profile.base_url || '';
+      document.getElementById('vault_key').value = profile.api_key || '';
+      document.getElementById('vault_notes').value = profile.notes || '';
+    }
+
+    function clearProviderForm() {
+      fillProviderForm({
+        id: '',
+        name: '',
+        provider: document.getElementById('ai_provider').value || 'openai',
+        model: '',
+        base_url: '',
+        api_key: '',
+        notes: '',
+      });
+    }
+
+    function readProviderForm() {
+      const provider = document.getElementById('vault_provider').value || 'openai';
+      const defaults = providerDefaults[provider] || providerDefaults.openai || { model: '', base_url: '' };
+      return {
+        id: document.getElementById('vault_id').value.trim(),
+        name: document.getElementById('vault_name').value.trim(),
+        provider,
+        model: document.getElementById('vault_model').value.trim() || defaults.model || '',
+        base_url: document.getElementById('vault_base_url').value.trim() || defaults.base_url || '',
+        api_key: document.getElementById('vault_key').value.trim(),
+        notes: document.getElementById('vault_notes').value.trim(),
+      };
+    }
+
+    function useProviderProfile(profileId) {
+      const profile = providerProfiles.find((item) => item.id === profileId);
+      if (!profile) {
+        setProviderStatus('Provider profile not found.');
+        return;
+      }
+      document.getElementById('ai_provider').value = profile.provider || 'openai';
+      document.getElementById('ai_model').value = profile.model || '';
+      document.getElementById('ai_base_url').value = profile.base_url || '';
+      document.getElementById('ai_key').value = profile.api_key || '';
+      setProviderStatus(`Loaded "${profile.name}" into AI Settings.`);
+    }
+
+    function editProviderProfile(profileId) {
+      const profile = providerProfiles.find((item) => item.id === profileId);
+      if (!profile) {
+        setProviderStatus('Provider profile not found.');
+        return;
+      }
+      fillProviderForm(profile);
+      setProviderStatus(`Editing "${profile.name}".`);
+    }
+
+    async function saveProviderProfile() {
+      const payload = readProviderForm();
+      if (!payload.name) {
+        setProviderStatus('Profile name is required.');
+        return;
+      }
+      const res = await fetch('/providers/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setProviderStatus(data.error || 'Failed to save provider profile.');
+        return;
+      }
+      setProviderStatus('Provider profile saved.');
+      window.location.reload();
+    }
+
+    async function deleteProviderProfile(profileId) {
+      const profile = providerProfiles.find((item) => item.id === profileId);
+      if (!profile) return;
+      if (!window.confirm(`Delete provider profile "${profile.name}"?`)) return;
+      const res = await fetch(`/providers/${profileId}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) {
+        setProviderStatus(data.error || 'Failed to delete provider profile.');
+        return;
+      }
+      setProviderStatus('Provider profile deleted.');
+      window.location.reload();
+    }
+
+    async function duplicateOC(ocId) {
+      const res = await fetch(`/oc/${ocId}/duplicate`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        setStatus(data.error || 'Duplicate failed.');
+        return;
+      }
+      window.location.href = `/oc/${data.oc_id}`;
+    }
+
+    async function togglePinOC(ocId) {
+      const res = await fetch(`/oc/${ocId}/pin`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        setStatus(data.error || 'Pin update failed.');
+        return;
+      }
+      window.location.reload();
+    }
+
+    async function deleteOC(ocId) {
+      if (!window.confirm('Delete this OC?')) return;
+      const res = await fetch(`/oc/${ocId}/delete`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        setStatus(data.error || 'Delete failed.');
+        return;
+      }
+      window.location.href = `/oc/${data.next_oc_id}`;
+    }
+
+    function closeOCMenus() {
+      document.querySelectorAll('[data-menu].open').forEach((menu) => menu.classList.remove('open'));
+      document.querySelectorAll('.oc-card.menu-open').forEach((card) => card.classList.remove('menu-open'));
+    }
+
+    function initOCMenus() {
+      document.querySelectorAll('[data-menu-trigger]').forEach((btn) => {
+        btn.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const card = btn.closest('.oc-card');
+          if (!card) return;
+          const menu = card.querySelector('[data-menu]');
+          if (!menu) return;
+          const isOpen = menu.classList.contains('open');
+          closeOCMenus();
+          if (!isOpen) {
+            menu.classList.add('open');
+            card.classList.add('menu-open');
+          }
+        });
+      });
+      document.querySelectorAll('.oc-menu button').forEach((button) => {
+        button.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const card = button.closest('.oc-card');
+          if (!card) return;
+          const ocId = card.dataset.ocId;
+          if (!ocId) return;
+          const action = button.dataset.action;
+          closeOCMenus();
+          if (action === 'duplicate') duplicateOC(ocId);
+          if (action === 'pin') togglePinOC(ocId);
+          if (action === 'delete') deleteOC(ocId);
+        });
+      });
+      document.addEventListener('click', () => closeOCMenus());
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') closeOCMenus();
+      });
+    }
+
     async function generateOC() {
       await saveOC();
       setStatus('Generating...');
@@ -1231,7 +1847,56 @@ TEMPLATE = r"""
       renderOnboardStep(onboardIndex - 1);
     }
 
+    function effectsEnabled() {
+      return localStorage.getItem(EFFECTS_ENABLED_KEY) !== '0';
+    }
+
+    function clearThemeEffects() {
+      if (fxLayerEl) fxLayerEl.innerHTML = '';
+    }
+
+    function spawnEffectNodes(kind, count) {
+      if (!fxLayerEl) return;
+      for (let i = 0; i < count; i += 1) {
+        const node = document.createElement('span');
+        node.className = kind;
+        node.style.left = `${Math.random() * 100}%`;
+        node.style.top = `${Math.random() * 100}%`;
+        node.style.animationDelay = `${(Math.random() * 6).toFixed(2)}s`;
+        node.style.animationDuration = `${(5 + Math.random() * 8).toFixed(2)}s`;
+        fxLayerEl.appendChild(node);
+      }
+    }
+
+    function applyThemeEffects(theme) {
+      clearThemeEffects();
+      if (!fxLayerEl) return;
+      if (!effectsEnabled()) return;
+      const rootStyle = getComputedStyle(document.documentElement);
+      const accent = (rootStyle.getPropertyValue('--accent') || '#60a5fa').trim();
+      const accent2 = (rootStyle.getPropertyValue('--accent-2') || '#a78bfa').trim();
+      fxLayerEl.style.setProperty('--fx-dot', accent2);
+      fxLayerEl.style.setProperty('--fx-dot-glow', accent2);
+      fxLayerEl.style.setProperty('--fx-comet', accent);
+      fxLayerEl.style.setProperty('--fx-comet-glow', accent);
+      fxLayerEl.style.setProperty('--fx-spark', accent);
+      fxLayerEl.style.setProperty('--fx-spark-glow', accent2);
+      const warmThemes = new Set(['solar', 'supernova', 'meteor', 'plasma']);
+      const coolThemes = new Set(['stellar', 'nebula', 'lunar', 'cosmos', 'void', 'orbit', 'dark', 'eclipse', 'aurora']);
+      if (warmThemes.has(theme)) {
+        spawnEffectNodes('fx-comet', 5);
+        spawnEffectNodes('fx-spark', 26);
+        return;
+      }
+      if (coolThemes.has(theme)) {
+        spawnEffectNodes('fx-dot', 46);
+        return;
+      }
+      spawnEffectNodes('fx-dot', 22);
+    }
+
     function applyTheme(next) {
+      activeThemeName = next || 'system';
       if (next === 'system') {
         document.documentElement.removeAttribute('data-theme');
       } else {
@@ -1242,6 +1907,7 @@ TEMPLATE = r"""
       themeButtons.forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.theme === next);
       });
+      applyThemeEffects(activeThemeName);
     }
 
     function initTheme() {
@@ -1252,6 +1918,38 @@ TEMPLATE = r"""
       }
       themeButtons.forEach((btn) => {
         btn.addEventListener('click', () => applyTheme(btn.dataset.theme || 'system'));
+      });
+    }
+
+    function initEffectsPanel() {
+      if (!effectsMenuBtnEl || !effectsPanelEl || !effectsEnabledEl) return;
+      effectsEnabledEl.checked = effectsEnabled();
+      effectsMenuBtnEl.addEventListener('click', (event) => {
+        event.stopPropagation();
+        effectsPanelEl.classList.toggle('open');
+      });
+      effectsEnabledEl.addEventListener('change', () => {
+        localStorage.setItem(EFFECTS_ENABLED_KEY, effectsEnabledEl.checked ? '1' : '0');
+        applyThemeEffects(activeThemeName);
+      });
+      document.addEventListener('click', (event) => {
+        if (!effectsPanelEl.classList.contains('open')) return;
+        if (effectsPanelEl.contains(event.target)) return;
+        if (effectsMenuBtnEl.contains(event.target)) return;
+        effectsPanelEl.classList.remove('open');
+      });
+    }
+
+    function initProviderVault() {
+      const providerSelect = document.getElementById('vault_provider');
+      if (!providerSelect) return;
+      providerSelect.addEventListener('change', () => {
+        const provider = providerSelect.value || 'openai';
+        const defaults = providerDefaults[provider] || providerDefaults.openai || { model: '', base_url: '' };
+        const modelEl = document.getElementById('vault_model');
+        const baseEl = document.getElementById('vault_base_url');
+        if (modelEl && !modelEl.value.trim()) modelEl.value = defaults.model || '';
+        if (baseEl && !baseEl.value.trim()) baseEl.value = defaults.base_url || '';
       });
     }
 
@@ -1406,8 +2104,11 @@ TEMPLATE = r"""
     initMode();
     initTemplate();
     initTheme();
+    initEffectsPanel();
+    initProviderVault();
     initHelpMode();
     initHelpModel();
+    initOCMenus();
     loadHelpHistory();
     renderOnboardStep(0);
     startAutosave();
