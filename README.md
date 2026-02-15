@@ -42,6 +42,10 @@ Notes:
 - Python 3.10+
 - `flask` and `requests` via `requirements.txt`
 
+## Security
+- API keys are stored in plaintext in `data/settings.json` and `data/providers.json`.
+- Keep `data/` out of git and treat it as sensitive local data.
+
 ## License
 See `LICENSE`.
 

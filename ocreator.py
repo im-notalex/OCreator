@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
-from flask import Flask, jsonify, redirect, render_template_string, request, url_for
+from flask import Flask, Response, jsonify, redirect, render_template_string, request, url_for
 
 APP_TITLE = "OCreator"
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -41,6 +41,9 @@ DEFAULT_SETTINGS = {
     "max_tokens": 1200,
 }
 
+MIN_TEMPERATURE = 0.0
+MAX_TEMPERATURE = 2.0
+
 DEFAULT_TEMPLATE = "\n".join(
     [
         "Name:",
@@ -62,6 +65,7 @@ DEFAULT_TEMPLATE = "\n".join(
 DEFAULT_OC = {
     "id": "",
     "name": "Untitled OC",
+    "tab_name": "Untitled OC",
     "mode": "scratch",
     "prompt": "",
     "existing_text": "",
@@ -108,26 +112,39 @@ def save_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def clamp_settings_values(settings: Dict[str, Any]) -> Dict[str, Any]:
+    provider = str(settings.get("provider", "openai") or "openai").strip()
+    if provider not in {p["id"] for p in PROVIDERS}:
+        provider = "openai"
+    defaults = PROVIDER_DEFAULTS.get(provider, PROVIDER_DEFAULTS["openai"])
+
+    try:
+        temperature = float(settings.get("temperature", DEFAULT_SETTINGS["temperature"]))
+    except Exception:
+        temperature = DEFAULT_SETTINGS["temperature"]
+    temperature = max(MIN_TEMPERATURE, min(MAX_TEMPERATURE, temperature))
+
+    try:
+        max_tokens = int(settings.get("max_tokens", DEFAULT_SETTINGS["max_tokens"]))
+    except Exception:
+        max_tokens = DEFAULT_SETTINGS["max_tokens"]
+
+    return {
+        "provider": provider,
+        "api_key": str(settings.get("api_key", "") or "").strip(),
+        "model": str(settings.get("model", "") or "").strip() or defaults["model"],
+        "base_url": str(settings.get("base_url", "") or "").strip() or defaults["base_url"],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+
 def load_settings() -> Dict[str, Any]:
     settings = load_json(SETTINGS_PATH, DEFAULT_SETTINGS.copy())
     merged = DEFAULT_SETTINGS.copy()
     if isinstance(settings, dict):
         merged.update({k: v for k, v in settings.items() if v is not None})
-    try:
-        merged["temperature"] = float(merged.get("temperature", DEFAULT_SETTINGS["temperature"]))
-    except Exception:
-        merged["temperature"] = DEFAULT_SETTINGS["temperature"]
-    try:
-        merged["max_tokens"] = int(merged.get("max_tokens", DEFAULT_SETTINGS["max_tokens"]))
-    except Exception:
-        merged["max_tokens"] = DEFAULT_SETTINGS["max_tokens"]
-    provider = merged.get("provider", "openai")
-    defaults = PROVIDER_DEFAULTS.get(provider, PROVIDER_DEFAULTS["openai"])
-    if not merged.get("model"):
-        merged["model"] = defaults["model"]
-    if not merged.get("base_url"):
-        merged["base_url"] = defaults["base_url"]
-    return merged
+    return clamp_settings_values(merged)
 
 
 def save_settings(settings: Dict[str, Any]) -> None:
@@ -169,6 +186,8 @@ def save_db(db: Dict[str, Any]) -> None:
 def ensure_oc_defaults(oc: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in DEFAULT_OC.items():
         oc.setdefault(key, value)
+    if not str(oc.get("tab_name", "")).strip():
+        oc["tab_name"] = oc.get("name", "Untitled OC")
     oc["pinned"] = bool(oc.get("pinned", False))
     return oc
 
@@ -258,6 +277,19 @@ def build_prompt(oc: Dict[str, Any], notes: str) -> str:
     return base + template_block + context + "Return the final OC text now."
 
 
+def build_quick_fix_prompt(source_text: str) -> str:
+    cleaned = sanitize_text(source_text)
+    return (
+        "You are fixing OC text for clarity and readability.\n"
+        "Only fix grammar, spelling, punctuation, formatting, and structure.\n"
+        "Do not add new lore, powers, backstory, or facts.\n"
+        "Keep meaning and details the same.\n"
+        "Output plain text only.\n\n"
+        f"OC text:\n{cleaned}\n\n"
+        "Return the corrected OC text now."
+    )
+
+
 def request_json(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
     resp = requests.post(url, headers=headers, json=payload, timeout=90)
     if resp.status_code >= 400:
@@ -288,6 +320,7 @@ def call_anthropic(settings: Dict[str, Any], prompt: str) -> str:
     url = base_url + "/messages"
     headers = {
         "x-api-key": settings.get("api_key", ""),
+        # Keep current with Anthropic docs if this API version is deprecated.
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
     }
@@ -317,9 +350,31 @@ def call_gemini(settings: Dict[str, Any], prompt: str) -> str:
     data = resp.json()
     candidates = data.get("candidates") or []
     if not candidates:
+        block_reason = data.get("promptFeedback", {}).get("blockReason")
+        if block_reason:
+            raise RuntimeError(f"Gemini blocked the prompt: {block_reason}")
         return ""
-    parts = candidates[0].get("content", {}).get("parts", [])
-    return "".join([p.get("text", "") for p in parts if isinstance(p, dict)])
+
+    texts: List[str] = []
+    finish_reasons: List[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        finish_reason = str(candidate.get("finishReason", "")).strip()
+        if finish_reason:
+            finish_reasons.append(finish_reason)
+        parts = candidate.get("content", {}).get("parts", []) or []
+        for part in parts:
+            if isinstance(part, dict) and part.get("text"):
+                texts.append(str(part.get("text")))
+
+    combined = "".join(texts).strip()
+    if combined:
+        return combined
+
+    if finish_reasons:
+        raise RuntimeError(f"Gemini returned no text. finishReason={','.join(finish_reasons)}")
+    raise RuntimeError("Gemini returned no text.")
 
 
 def call_llm(settings: Dict[str, Any], prompt: str) -> str:
@@ -394,6 +449,7 @@ def duplicate_oc_route(oc_id: str):
     duplicate.update({k: v for k, v in source.items() if k in DEFAULT_OC})
     duplicate["id"] = uuid.uuid4().hex[:10]
     duplicate["name"] = f"{source.get('name') or 'Untitled OC'} (Copy)"
+    duplicate["tab_name"] = f"{source.get('tab_name') or source.get('name') or 'Untitled OC'} (Copy)"
     duplicate["pinned"] = False
     duplicate["updated_at"] = now_iso()
     db["ocs"].append(duplicate)
@@ -444,6 +500,7 @@ def save_oc(oc_id: str):
     payload = request.get_json(silent=True) or {}
     for key in (
         "name",
+        "tab_name",
         "mode",
         "prompt",
         "existing_text",
@@ -485,6 +542,56 @@ def generate_oc(oc_id: str):
     oc["updated_at"] = now_iso()
     save_db(db)
     return jsonify({"result": response, "name": oc.get("name", "")})
+
+
+@app.route("/oc/<oc_id>/quick-fix", methods=["POST"])
+def quick_fix_oc_route(oc_id: str):
+    ensure_dirs()
+    db = load_db()
+    oc = get_oc(db, oc_id)
+    if not oc:
+        return jsonify({"error": "OC not found"}), 404
+    source_text = sanitize_text(oc.get("existing_text", "") or oc.get("result_text", "") or "")
+    if not source_text:
+        return jsonify({"error": "Add Existing OC Text or generate a Result first."}), 400
+    settings = load_settings()
+    quick_settings = settings.copy()
+    quick_settings["temperature"] = max(MIN_TEMPERATURE, min(0.2, float(settings.get("temperature", 0.0))))
+    quick_settings["max_tokens"] = max(200, min(2000, int(settings.get("max_tokens", 1200))))
+    try:
+        response = call_llm(quick_settings, build_quick_fix_prompt(source_text))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+    response = sanitize_text(response)
+    oc["result_text"] = response
+    oc["updated_at"] = now_iso()
+    save_db(db)
+    return jsonify({"ok": True, "result": response})
+
+
+@app.route("/oc/<oc_id>/export")
+def export_oc_route(oc_id: str):
+    ensure_dirs()
+    db = load_db()
+    oc = get_oc(db, oc_id)
+    if not oc:
+        return jsonify({"error": "OC not found"}), 404
+    fmt = str(request.args.get("format", "txt")).strip().lower()
+    safe_name = "".join(c for c in (oc.get("name") or "oc") if c.isalnum() or c in {"-", "_", " "}).strip()
+    safe_name = (safe_name or "oc").replace(" ", "_")
+    if fmt == "json":
+        payload = json.dumps(oc, indent=2, ensure_ascii=False)
+        return Response(
+            payload,
+            mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{safe_name}.json"'},
+        )
+    text = sanitize_text(oc.get("result_text", "") or oc.get("existing_text", "") or oc.get("prompt", ""))
+    return Response(
+        text,
+        mimetype="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.txt"'},
+    )
 
 
 @app.route("/providers/save", methods=["POST"])
@@ -533,9 +640,35 @@ def save_settings_route():
     ensure_dirs()
     payload = request.get_json(silent=True) or {}
     settings = load_settings()
-    settings.update({k: v for k, v in payload.items() if k in settings})
+    settings.update({k: v for k, v in payload.items() if k in DEFAULT_SETTINGS})
+    settings = clamp_settings_values(settings)
     save_settings(settings)
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "settings": settings})
+
+
+@app.route("/settings/test", methods=["POST"])
+def test_settings_route():
+    ensure_dirs()
+    payload = request.get_json(silent=True) or {}
+    settings = load_settings()
+    settings.update({k: v for k, v in payload.items() if k in DEFAULT_SETTINGS})
+    settings = clamp_settings_values(settings)
+    test_prompt = "Reply with exactly: hi"
+    test_settings = settings.copy()
+    test_settings["max_tokens"] = 40
+    test_settings["temperature"] = max(MIN_TEMPERATURE, min(0.3, float(settings.get("temperature", 0.0))))
+    try:
+        result = call_llm(test_settings, test_prompt)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify(
+        {
+            "ok": True,
+            "provider": settings.get("provider", ""),
+            "model": settings.get("model", ""),
+            "preview": sanitize_text(result)[:120],
+        }
+    )
 
 
 TEMPLATE = r"""
@@ -693,6 +826,34 @@ TEMPLATE = r"""
       margin-top: 4px;
     }
     .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    [data-tip] { position: relative; }
+    [data-tip]::after {
+      content: attr(data-tip);
+      position: absolute;
+      left: 50%;
+      bottom: calc(100% + 8px);
+      transform: translateX(-50%) translateY(4px);
+      background: rgba(6, 10, 18, 0.95);
+      color: #e2e8f0;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 11px;
+      line-height: 1.25;
+      width: max-content;
+      max-width: 240px;
+      text-align: center;
+      opacity: 0;
+      pointer-events: none;
+      z-index: 120;
+      box-shadow: 0 10px 20px rgba(0, 0, 0, 0.35);
+      transition: opacity 120ms ease, transform 120ms ease;
+      white-space: normal;
+    }
+    [data-tip]:hover::after, [data-tip]:focus-visible::after {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
     .btn {
       border: none;
       padding: 9px 16px;
@@ -720,6 +881,45 @@ TEMPLATE = r"""
       border-radius: 12px;
       font-weight: 700;
       padding: 0;
+    }
+    .conn-toast {
+      position: fixed;
+      top: 14px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-8px);
+      padding: 9px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      font-size: 13px;
+      font-weight: 700;
+      display: none;
+      align-items: center;
+      gap: 8px;
+      z-index: 140;
+      opacity: 0;
+      transition: opacity 160ms ease, transform 160ms ease;
+      box-shadow: 0 10px 22px rgba(0, 0, 0, 0.35);
+      backdrop-filter: blur(10px);
+    }
+    .conn-toast.show {
+      display: inline-flex;
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+    .conn-toast.ok {
+      background: rgba(22, 163, 74, 0.18);
+      border-color: rgba(34, 197, 94, 0.55);
+      color: #86efac;
+    }
+    .conn-toast.err {
+      background: rgba(220, 38, 38, 0.18);
+      border-color: rgba(248, 113, 113, 0.55);
+      color: #fca5a5;
+    }
+    .conn-toast .icon {
+      font-size: 14px;
+      font-weight: 900;
+      line-height: 1;
     }
     .layout {
       display: grid;
@@ -750,7 +950,8 @@ TEMPLATE = r"""
       flex-direction: column;
       gap: 10px;
       max-height: 70vh;
-      overflow: auto;
+      overflow-y: auto;
+      overflow-x: hidden;
     }
     .oc-card {
       position: relative;
@@ -1161,6 +1362,10 @@ TEMPLATE = r"""
 </head>
 <body>
   <div id="fx_layer" class="fx-layer" aria-hidden="true"></div>
+  <div id="conn_toast" class="conn-toast" aria-live="polite">
+    <span id="conn_toast_icon" class="icon">✓</span>
+    <span id="conn_toast_text"></span>
+  </div>
   <header>
     <div>
       <div class="brand">{{ app_title }}</div>
@@ -1168,7 +1373,7 @@ TEMPLATE = r"""
     </div>
     <div class="row">
       <div class="theme-control">
-        <div class="theme-picker" id="theme_picker" role="radiogroup" aria-label="Theme">
+        <div class="theme-picker" id="theme_picker" role="radiogroup" aria-label="Theme" data-tip="Pick a color theme for the app UI.">
           <button type="button" class="theme-option" data-theme="system"><span class="theme-swatch" data-theme="system"></span></button>
           <button type="button" class="theme-option" data-theme="light"><span class="theme-swatch" data-theme="light"></span></button>
           <button type="button" class="theme-option" data-theme="dark"><span class="theme-swatch" data-theme="dark"></span></button>
@@ -1202,7 +1407,7 @@ TEMPLATE = r"""
           <option value="plasma">Plasma</option>
           <option value="meteor">Meteor</option>
         </select>
-        <button class="effects-menu-btn" id="effects_menu_btn" type="button">Effects</button>
+        <button class="effects-menu-btn" id="effects_menu_btn" type="button" data-tip="Toggle ambient visual effects for the selected theme.">Effects</button>
         <div class="effects-panel" id="effects_panel">
           <div class="effects-line">
             <span>Theme effects</span>
@@ -1213,7 +1418,7 @@ TEMPLATE = r"""
       </div>
       <button class="btn ghost" type="button" onclick="toggleOnboard(true)">Guide</button>
       <button class="btn ghost help-btn" type="button" onclick="toggleHelp(true)" title="Help">?</button>
-      <button class="btn ghost" type="button" onclick="saveOC()">Save</button>
+      <button class="btn ghost" type="button" onclick="saveOC()" data-tip="Save your current OC fields now.">Save</button>
       <form method="post" action="{{ url_for('create_oc_route') }}">
         <button class="btn secondary" type="submit">New OC</button>
       </form>
@@ -1225,8 +1430,17 @@ TEMPLATE = r"""
       <h3>AI Settings</h3>
       <div class="grid">
         <div>
+          <label>Saved Profile</label>
+          <select id="ai_profile_select" data-tip="Select a saved provider profile to quickly fill AI settings.">
+            <option value="">Manual / Current Settings</option>
+            {% for profile in provider_profiles %}
+            <option value="{{ profile.id }}">{{ profile.name or 'Unnamed Provider' }} ({{ profile.provider }})</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
           <label>Provider</label>
-          <select id="ai_provider">
+          <select id="ai_provider" data-tip="Choose which AI provider endpoint to call for generation.">
             {% for provider in providers %}
             <option value="{{ provider.id }}" {% if settings.provider == provider.id %}selected{% endif %}>{{ provider.label }}</option>
             {% endfor %}
@@ -1250,10 +1464,16 @@ TEMPLATE = r"""
         </div>
         <div>
           <label>Max Tokens</label>
-          <input id="ai_tokens" type="number" min="128" max="4096" step="64" value="{{ settings.max_tokens }}" />
+          <input id="ai_tokens" type="number" step="1" value="{{ settings.max_tokens }}" />
         </div>
         <div>
-          <button class="btn ghost" type="button" onclick="saveSettings()">Save AI Settings</button>
+          <button class="btn ghost" type="button" onclick="saveSettings()" data-tip="Store provider, model, key, and tuning values in data/settings.json.">Save AI Settings</button>
+        </div>
+        <div>
+          <button class="btn ghost" type="button" onclick="applySelectedProfileToSettings()" data-tip="Copy the selected saved profile into the AI Settings fields.">Apply Selected Profile</button>
+        </div>
+        <div>
+          <button class="btn ghost" type="button" onclick="testConnection()" data-tip="Run a quick provider ping to confirm key/model/base URL works.">Test Connection</button>
         </div>
       </div>
 
@@ -1275,6 +1495,10 @@ TEMPLATE = r"""
         <div>
           <label>OC Name</label>
           <input id="oc_name" value="{{ oc.name }}" placeholder="OC name" />
+        </div>
+        <div>
+          <label>Tab Name</label>
+          <input id="oc_tab_name" value="{{ oc.tab_name }}" placeholder="Name shown in OC Library" />
         </div>
         <div>
           <label>Mode</label>
@@ -1317,8 +1541,9 @@ TEMPLATE = r"""
       </div>
 
       <div class="row" style="margin-top: 12px;">
-        <button class="btn" type="button" onclick="generateOC()">Generate</button>
-        <button class="btn ghost" type="button" onclick="applyResult()">Apply Result</button>
+        <button class="btn" type="button" onclick="generateOC()" data-tip="Generate OC output using your current mode and settings.">Generate</button>
+        <button class="btn ghost" type="button" onclick="quickFixOC()" data-tip="Fix grammar/spelling/structure without adding new lore.">Quick Fix</button>
+        <button class="btn ghost" type="button" onclick="applyResult()" data-tip="Copy result text into Existing OC Text for another pass.">Apply Result</button>
       </div>
 
       <div style="margin-top: 12px;">
@@ -1333,7 +1558,7 @@ TEMPLATE = r"""
         {% for item in ocs %}
         <div class="oc-card {% if item.id == oc.id %}active{% endif %} {% if item.pinned %}pinned{% endif %}" data-oc-id="{{ item.id }}">
           <a class="oc-link" href="{{ url_for('edit_oc', oc_id=item.id) }}">
-            <div class="title">{{ item.name or 'Untitled OC' }}</div>
+            <div class="title">{{ item.tab_name or item.name or 'Untitled OC' }}</div>
             <div class="meta">{{ item.updated_at or 'New' }}</div>
           </a>
           <div class="oc-menu-wrap">
@@ -1341,6 +1566,8 @@ TEMPLATE = r"""
             <div class="oc-menu" data-menu>
               <button type="button" data-action="duplicate">Duplicate</button>
               <button type="button" data-action="pin">{% if item.pinned %}Unpin{% else %}Pin{% endif %}</button>
+              <button type="button" data-action="export_txt">Export TXT</button>
+              <button type="button" data-action="export_json">Export JSON</button>
               <button type="button" data-action="delete">Delete</button>
             </div>
           </div>
@@ -1383,7 +1610,7 @@ TEMPLATE = r"""
         </div>
       </div>
       <div class="row" style="margin-top: 10px;">
-        <button class="btn ghost" type="button" onclick="saveProviderProfile()">Save Profile</button>
+        <button class="btn ghost" type="button" onclick="saveProviderProfile()" data-tip="Save these provider credentials/details in the local vault.">Save Profile</button>
         <button class="btn ghost" type="button" onclick="clearProviderForm()">Clear</button>
       </div>
       <div class="hint" id="provider_status" style="margin-top: 8px;">Profiles are saved to data/providers.json.</div>
@@ -1395,9 +1622,9 @@ TEMPLATE = r"""
             <div class="meta">{{ profile.provider }}{% if profile.model %} • {{ profile.model }}{% endif %}</div>
           </div>
           <div class="provider-row">
-            <button class="btn ghost" type="button" onclick="useProviderProfile('{{ profile.id }}')">Use</button>
-            <button class="btn ghost" type="button" onclick="editProviderProfile('{{ profile.id }}')">Edit</button>
-            <button class="btn ghost" type="button" onclick="deleteProviderProfile('{{ profile.id }}')">Delete</button>
+            <button class="btn ghost" type="button" onclick="useProviderProfile('{{ profile.id }}')" data-tip="Load this profile into AI Settings.">Use</button>
+            <button class="btn ghost" type="button" onclick="editProviderProfile('{{ profile.id }}')" data-tip="Load this profile into the vault form for editing.">Edit</button>
+            <button class="btn ghost" type="button" onclick="deleteProviderProfile('{{ profile.id }}')" data-tip="Delete this saved provider profile.">Delete</button>
           </div>
         </div>
         {% endfor %}
@@ -1474,6 +1701,19 @@ TEMPLATE = r"""
     </div>
   </div>
 
+  <div class="modal" id="confirm_modal" aria-hidden="true">
+    <div class="modal-card" style="max-width: 460px;">
+      <div class="row" style="justify-content: space-between; margin-bottom: 8px;">
+        <h2 id="confirm_title">Confirm</h2>
+      </div>
+      <p id="confirm_body" class="hint" style="font-size: 14px; margin-top: 0;"></p>
+      <div class="row" style="justify-content: flex-end; margin-top: 12px;">
+        <button class="btn ghost" type="button" id="confirm_cancel_btn">Cancel</button>
+        <button class="btn" type="button" id="confirm_ok_btn">Delete</button>
+      </div>
+    </div>
+  </div>
+
   <script src="https://js.puter.com/v2/"></script>
   <script>
     const OC_ID = "{{ oc.id }}";
@@ -1481,6 +1721,7 @@ TEMPLATE = r"""
     const templateMode = document.getElementById('template_mode');
     const statusProgressEl = document.getElementById('status_progress');
     const statusSaveEl = document.getElementById('status_save');
+    const aiProfileSelectEl = document.getElementById('ai_profile_select');
     const helpModalEl = document.getElementById('help_modal');
     const helpModeToggleEl = document.getElementById('help_mode_toggle');
     const helpModelEl = document.getElementById('help_model');
@@ -1489,11 +1730,19 @@ TEMPLATE = r"""
     const helpStatusHintEl = document.getElementById('help_status_hint');
     const themeSelect = document.getElementById('theme_select');
     const themeButtons = document.querySelectorAll('.theme-option');
+    const connToastEl = document.getElementById('conn_toast');
+    const connToastIconEl = document.getElementById('conn_toast_icon');
+    const connToastTextEl = document.getElementById('conn_toast_text');
     const fxLayerEl = document.getElementById('fx_layer');
     const effectsMenuBtnEl = document.getElementById('effects_menu_btn');
     const effectsPanelEl = document.getElementById('effects_panel');
     const effectsEnabledEl = document.getElementById('effects_enabled');
     const onboardModalEl = document.getElementById('onboard_modal');
+    const confirmModalEl = document.getElementById('confirm_modal');
+    const confirmTitleEl = document.getElementById('confirm_title');
+    const confirmBodyEl = document.getElementById('confirm_body');
+    const confirmOkBtnEl = document.getElementById('confirm_ok_btn');
+    const confirmCancelBtnEl = document.getElementById('confirm_cancel_btn');
     const onboardProgressEl = document.getElementById('onboard_progress');
     const onboardStepTitleEl = document.getElementById('onboard_step_title');
     const onboardStepBodyEl = document.getElementById('onboard_step_body');
@@ -1510,6 +1759,8 @@ TEMPLATE = r"""
     const EFFECTS_ENABLED_KEY = 'ocreator_effects_enabled';
 
     let activeThemeName = 'system';
+    let confirmResolver = null;
+    let connToastTimer = null;
 
     const ONBOARD_STEPS = [
       { title: 'Pick a mode', body: 'Create for new characters, Modify for cleanup, Enhance for targeted improvements.' },
@@ -1548,6 +1799,7 @@ TEMPLATE = r"""
     function collectPayload() {
       return {
         name: document.getElementById('oc_name').value,
+        tab_name: document.getElementById('oc_tab_name').value,
         mode: document.querySelector('#mode_toggle button.active')?.dataset.mode || 'scratch',
         prompt: document.getElementById('oc_prompt').value,
         existing_text: document.getElementById('oc_existing').value,
@@ -1585,24 +1837,101 @@ TEMPLATE = r"""
     }
 
     async function saveSettings() {
-      const payload = {
+      const payload = clampSettingsPayload({
         provider: document.getElementById('ai_provider').value,
         model: document.getElementById('ai_model').value,
         api_key: document.getElementById('ai_key').value,
         base_url: document.getElementById('ai_base_url').value,
         temperature: parseFloat(document.getElementById('ai_temp').value || '0.7'),
         max_tokens: parseInt(document.getElementById('ai_tokens').value || '1200', 10),
-      };
+      });
+      document.getElementById('ai_temp').value = String(payload.temperature);
+      document.getElementById('ai_tokens').value = String(payload.max_tokens);
       const res = await fetch('/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+      const data = await res.json();
       if (!res.ok) {
         setStatus('Settings save failed.');
         return;
       }
+      if (data.settings) {
+        document.getElementById('ai_temp').value = String(data.settings.temperature);
+        document.getElementById('ai_tokens').value = String(data.settings.max_tokens);
+      }
       setStatus('Settings saved.');
+    }
+
+    function clampSettingsPayload(payload) {
+      const safe = { ...payload };
+      const temp = Number.isFinite(safe.temperature) ? safe.temperature : 0.7;
+      safe.temperature = Math.max(0, Math.min(2, temp));
+      safe.max_tokens = Number.isFinite(safe.max_tokens) ? Math.round(safe.max_tokens) : 1200;
+      return safe;
+    }
+
+    function applyProfileToSettings(profile) {
+      if (!profile) return;
+      document.getElementById('ai_provider').value = profile.provider || 'openai';
+      document.getElementById('ai_model').value = profile.model || '';
+      document.getElementById('ai_base_url').value = profile.base_url || '';
+      document.getElementById('ai_key').value = profile.api_key || '';
+      setStatus(`Loaded profile "${profile.name || 'Unnamed Provider'}".`);
+    }
+
+    function applySelectedProfileToSettings() {
+      if (!aiProfileSelectEl) return;
+      const profileId = aiProfileSelectEl.value;
+      if (!profileId) {
+        setStatus('No saved profile selected.');
+        return;
+      }
+      const profile = providerProfiles.find((item) => item.id === profileId);
+      if (!profile) {
+        setStatus('Selected profile no longer exists.');
+        return;
+      }
+      applyProfileToSettings(profile);
+    }
+
+    async function testConnection() {
+      const payload = clampSettingsPayload({
+        provider: document.getElementById('ai_provider').value,
+        model: document.getElementById('ai_model').value,
+        api_key: document.getElementById('ai_key').value,
+        base_url: document.getElementById('ai_base_url').value,
+        temperature: parseFloat(document.getElementById('ai_temp').value || '0.7'),
+        max_tokens: parseInt(document.getElementById('ai_tokens').value || '1200', 10),
+      });
+      const res = await fetch('/settings/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        showConnToast(false, data.error || 'Connection test failed.');
+        return;
+      }
+      showConnToast(true, `${data.provider} / ${data.model}`);
+    }
+
+    function showConnToast(ok, text) {
+      if (!connToastEl || !connToastTextEl || !connToastIconEl) return;
+      connToastEl.classList.remove('ok', 'err');
+      connToastEl.classList.add(ok ? 'ok' : 'err');
+      connToastIconEl.textContent = ok ? '✓' : '✕';
+      connToastTextEl.textContent = text || (ok ? 'Connection OK' : 'Connection failed');
+      connToastEl.classList.add('show');
+      if (connToastTimer) {
+        clearTimeout(connToastTimer);
+        connToastTimer = null;
+      }
+      connToastTimer = setTimeout(() => {
+        connToastEl.classList.remove('show');
+      }, ok ? 2600 : 3600);
     }
 
     function setProviderStatus(text) {
@@ -1651,10 +1980,8 @@ TEMPLATE = r"""
         setProviderStatus('Provider profile not found.');
         return;
       }
-      document.getElementById('ai_provider').value = profile.provider || 'openai';
-      document.getElementById('ai_model').value = profile.model || '';
-      document.getElementById('ai_base_url').value = profile.base_url || '';
-      document.getElementById('ai_key').value = profile.api_key || '';
+      applyProfileToSettings(profile);
+      if (aiProfileSelectEl) aiProfileSelectEl.value = profile.id;
       setProviderStatus(`Loaded "${profile.name}" into AI Settings.`);
     }
 
@@ -1691,7 +2018,11 @@ TEMPLATE = r"""
     async function deleteProviderProfile(profileId) {
       const profile = providerProfiles.find((item) => item.id === profileId);
       if (!profile) return;
-      if (!window.confirm(`Delete provider profile "${profile.name}"?`)) return;
+      const confirmed = await askConfirm(
+        'Delete Provider Profile',
+        `Delete provider profile "${profile.name}"? This cannot be undone.`
+      );
+      if (!confirmed) return;
       const res = await fetch(`/providers/${profileId}`, { method: 'DELETE' });
       const data = await res.json();
       if (!res.ok) {
@@ -1723,7 +2054,8 @@ TEMPLATE = r"""
     }
 
     async function deleteOC(ocId) {
-      if (!window.confirm('Delete this OC?')) return;
+      const confirmed = await askConfirm('Delete OC', 'Delete this OC? This cannot be undone.');
+      if (!confirmed) return;
       const res = await fetch(`/oc/${ocId}/delete`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) {
@@ -1731,6 +2063,11 @@ TEMPLATE = r"""
         return;
       }
       window.location.href = `/oc/${data.next_oc_id}`;
+    }
+
+    function exportOC(ocId, format) {
+      const next = format === 'json' ? 'json' : 'txt';
+      window.location.href = `/oc/${ocId}/export?format=${next}`;
     }
 
     function closeOCMenus() {
@@ -1767,12 +2104,15 @@ TEMPLATE = r"""
           closeOCMenus();
           if (action === 'duplicate') duplicateOC(ocId);
           if (action === 'pin') togglePinOC(ocId);
+          if (action === 'export_txt') exportOC(ocId, 'txt');
+          if (action === 'export_json') exportOC(ocId, 'json');
           if (action === 'delete') deleteOC(ocId);
         });
       });
       document.addEventListener('click', () => closeOCMenus());
       document.addEventListener('keydown', (event) => {
         if (event.key === 'Escape') closeOCMenus();
+        if (event.key === 'Escape' && confirmModalEl?.classList.contains('open')) resolveConfirm(false);
       });
     }
 
@@ -1796,6 +2136,19 @@ TEMPLATE = r"""
       setStatus('Done.');
     }
 
+    async function quickFixOC() {
+      await saveOC();
+      setStatus('Quick fixing...');
+      const res = await fetch(`/oc/${OC_ID}/quick-fix`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        setStatus(data.error || 'Quick fix failed.');
+        return;
+      }
+      document.getElementById('oc_result').value = data.result || '';
+      setStatus('Quick fix complete.');
+    }
+
     function applyResult() {
       const result = document.getElementById('oc_result').value;
       if (!result) return;
@@ -1814,6 +2167,33 @@ TEMPLATE = r"""
       onboardModalEl.classList.toggle('open', show);
       onboardModalEl.setAttribute('aria-hidden', show ? 'false' : 'true');
       if (show) renderOnboardStep(onboardIndex);
+    }
+
+    function setConfirmOpen(show) {
+      if (!confirmModalEl) return;
+      confirmModalEl.classList.toggle('open', show);
+      confirmModalEl.setAttribute('aria-hidden', show ? 'false' : 'true');
+    }
+
+    function resolveConfirm(value) {
+      if (confirmResolver) {
+        const next = confirmResolver;
+        confirmResolver = null;
+        next(Boolean(value));
+      }
+      setConfirmOpen(false);
+    }
+
+    function askConfirm(title, body) {
+      if (!confirmModalEl || !confirmTitleEl || !confirmBodyEl) {
+        return Promise.resolve(false);
+      }
+      confirmTitleEl.textContent = title || 'Confirm';
+      confirmBodyEl.textContent = body || 'Are you sure?';
+      setConfirmOpen(true);
+      return new Promise((resolve) => {
+        confirmResolver = resolve;
+      });
     }
 
     function renderOnboardStep(index) {
@@ -1950,6 +2330,25 @@ TEMPLATE = r"""
         const baseEl = document.getElementById('vault_base_url');
         if (modelEl && !modelEl.value.trim()) modelEl.value = defaults.model || '';
         if (baseEl && !baseEl.value.trim()) baseEl.value = defaults.base_url || '';
+      });
+    }
+
+    function initAIProfiles() {
+      if (!aiProfileSelectEl) return;
+      const provider = document.getElementById('ai_provider').value || '';
+      const model = document.getElementById('ai_model').value || '';
+      const baseUrl = document.getElementById('ai_base_url').value || '';
+      const matched = providerProfiles.find((item) => (
+        (item.provider || '') === provider
+        && (item.model || '') === model
+        && (item.base_url || '') === baseUrl
+      ));
+      if (matched) {
+        aiProfileSelectEl.value = matched.id;
+      }
+      aiProfileSelectEl.addEventListener('change', () => {
+        if (!aiProfileSelectEl.value) return;
+        applySelectedProfileToSettings();
       });
     }
 
@@ -2094,6 +2493,14 @@ TEMPLATE = r"""
       });
     }
 
+    if (confirmOkBtnEl) confirmOkBtnEl.addEventListener('click', () => resolveConfirm(true));
+    if (confirmCancelBtnEl) confirmCancelBtnEl.addEventListener('click', () => resolveConfirm(false));
+    if (confirmModalEl) {
+      confirmModalEl.addEventListener('click', (event) => {
+        if (event.target === confirmModalEl) resolveConfirm(false);
+      });
+    }
+
     function startAutosave() {
       setInterval(() => {
         if (document.hidden) return;
@@ -2105,6 +2512,7 @@ TEMPLATE = r"""
     initTemplate();
     initTheme();
     initEffectsPanel();
+    initAIProfiles();
     initProviderVault();
     initHelpMode();
     initHelpModel();
