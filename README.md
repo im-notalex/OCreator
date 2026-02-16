@@ -7,6 +7,8 @@
 
 **OCreator is a local-first OC persona builder. Create a playable character from a prompt, clean up an existing persona, or enhance a draft, all as a single text output for platforms like Chub or Janitor.**
 
+![main](https://raw.githubusercontent.com/im-notalex/storage-n-stuff/refs/heads/main/OCreator/Main.png)
+
 ## ***Quick start (main QoL)***
 1) Double-click `quickstart.bat`
 2) The script installs requirements if needed and launches the app
