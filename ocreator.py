@@ -6,10 +6,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
-from flask import Flask, Response, jsonify, redirect, render_template_string, request, url_for
+from flask import Flask, Response, jsonify, redirect, render_template_string, request, send_from_directory, url_for
 
 APP_TITLE = "OCreator"
 DATA_DIR = Path(__file__).resolve().parent / "data"
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 DB_PATH = DATA_DIR / "ocs.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 PROVIDERS_PATH = DATA_DIR / "providers.json"
@@ -24,11 +25,11 @@ PROVIDERS = [
 ]
 
 PROVIDER_DEFAULTS = {
-    "openai": {"model": "gpt-4o-mini", "base_url": "https://api.openai.com/v1"},
-    "gemini": {"model": "gemini-1.5-pro", "base_url": "https://generativelanguage.googleapis.com/v1beta"},
-    "anthropic": {"model": "claude-3-5-sonnet-latest", "base_url": "https://api.anthropic.com/v1"},
-    "grok": {"model": "grok-2-latest", "base_url": "https://api.x.ai/v1"},
-    "openrouter": {"model": "openai/gpt-4o-mini", "base_url": "https://openrouter.ai/api/v1"},
+    "openai": {"model": "gpt-5-nano", "base_url": "https://api.openai.com/v1"},
+    "gemini": {"model": "gemini-2.5-flash", "base_url": "https://generativelanguage.googleapis.com/v1beta"},
+    "anthropic": {"model": "claude-3-5-haiku-latest", "base_url": "https://api.anthropic.com/v1"},
+    "grok": {"model": "grok-3-mini", "base_url": "https://api.x.ai/v1"},
+    "openrouter": {"model": "openai/gpt-5-nano", "base_url": "https://openrouter.ai/api/v1"},
     "openai_compatible": {"model": "your-model", "base_url": "http://localhost:1234/v1"},
 }
 
@@ -429,6 +430,11 @@ def legacy_bot_route(oc_id: str):
     return redirect(url_for("edit_oc", oc_id=oc_id))
 
 
+@app.route("/assets/<path:filename>")
+def assets_route(filename: str):
+    return send_from_directory(ASSETS_DIR, filename)
+
+
 @app.route("/oc/new", methods=["POST"])
 def create_oc_route():
     ensure_dirs()
@@ -743,6 +749,21 @@ TEMPLATE = r"""
     :root[data-theme="orbit"] { --accent: #60a5fa; --accent-2: #34d399; --bg: #0b0f17; --bg-2: #121a2a; }
     :root[data-theme="plasma"] { --accent: #ec4899; --accent-2: #f59e0b; --bg: #110714; --bg-2: #1a0a1d; }
     :root[data-theme="meteor"] { --accent: #f97316; --accent-2: #22d3ee; --bg: #100c0c; --bg-2: #171010; }
+    :root[data-theme="gdimp"] {
+      --accent: #00ff66;
+      --accent-2: #ff00aa;
+      --bg: #ff0000;
+      --bg-2: #00a2ff;
+      --ink: #111111;
+      --muted: #1b1b1b;
+      --card: rgba(255, 255, 255, 0.9);
+      --border: rgba(0, 0, 0, 0.35);
+      --surface: #fff761;
+      --input-bg: #ffffff;
+      --soft: rgba(255, 255, 255, 0.8);
+      --focus: rgba(255, 0, 170, 0.35);
+      --glow: rgba(0, 255, 102, 0.35);
+    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
@@ -752,6 +773,48 @@ TEMPLATE = r"""
       background: radial-gradient(1200px circle at 15% 0%, rgba(31, 191, 147, 0.15), transparent 40%),
                   radial-gradient(1000px circle at 85% 10%, rgba(65, 182, 255, 0.18), transparent 45%),
                   linear-gradient(135deg, var(--bg), var(--bg-2));
+    }
+    :root[data-theme="gdimp"] body {
+      font-family: "Comic Sans MS", "Manrope", "Segoe UI", cursive, sans-serif;
+      background: linear-gradient(
+        90deg,
+        #ff3b3b 0%,
+        #ff8a00 16%,
+        #ffe45c 32%,
+        #44d66b 48%,
+        #23b5ff 64%,
+        #6a5cff 80%,
+        #d34bff 100%
+      );
+      background-size: 100% 100%;
+      animation: gdimp-rainbow-shift 70s ease-in-out infinite;
+    }
+    :root[data-theme="gdimp"] * {
+      font-family: "Comic Sans MS", "Comic Sans", cursive, sans-serif !important;
+    }
+    :root[data-theme="gdimp"] header {
+      background: linear-gradient(
+        90deg,
+        #ff3b3b 0%,
+        #ff8a00 16%,
+        #ffe45c 32%,
+        #44d66b 48%,
+        #23b5ff 64%,
+        #6a5cff 80%,
+        #d34bff 100%
+      );
+      background-size: 100% 100%;
+      animation: gdimp-rainbow-shift 85s ease-in-out infinite;
+      border-bottom-color: rgba(0, 0, 0, 0.4);
+    }
+    @keyframes gdimp-rainbow-shift {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 4% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    html, body {
+      max-width: 100%;
+      overflow-x: hidden;
     }
     header {
       position: sticky;
@@ -875,6 +938,14 @@ TEMPLATE = r"""
       border: 1px solid var(--border);
       box-shadow: none;
     }
+    :root[data-theme="gdimp"] .btn,
+    :root[data-theme="gdimp"] .panel,
+    :root[data-theme="gdimp"] input,
+    :root[data-theme="gdimp"] select,
+    :root[data-theme="gdimp"] textarea {
+      border-radius: 0;
+      box-shadow: none;
+    }
     .help-btn {
       width: 36px;
       height: 36px;
@@ -900,6 +971,9 @@ TEMPLATE = r"""
       transition: opacity 160ms ease, transform 160ms ease;
       box-shadow: 0 10px 22px rgba(0, 0, 0, 0.35);
       backdrop-filter: blur(10px);
+      max-width: calc(100vw - 20px);
+      white-space: normal;
+      overflow-wrap: anywhere;
     }
     .conn-toast.show {
       display: inline-flex;
@@ -921,6 +995,44 @@ TEMPLATE = r"""
       font-weight: 900;
       line-height: 1;
     }
+    .gdimp-video-wrap {
+      position: fixed;
+      right: 12px;
+      bottom: 98px;
+      width: min(420px, calc(100vw - 24px));
+      border: 2px solid rgba(0, 0, 0, 0.45);
+      background: rgba(255, 255, 255, 0.9);
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.35);
+      display: none;
+      z-index: 35;
+    }
+    .gdimp-video-wrap.hidden-by-user {
+      display: none !important;
+    }
+    .gdimp-video-close {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      width: 28px;
+      height: 28px;
+      border: 1px solid rgba(0, 0, 0, 0.45);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.94);
+      color: #111;
+      font-weight: 900;
+      cursor: pointer;
+      z-index: 2;
+      line-height: 1;
+    }
+    .gdimp-video-frame {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      border: 0;
+      display: block;
+    }
+    :root[data-theme="gdimp"] .gdimp-video-wrap {
+      display: block;
+    }
     .layout {
       display: grid;
       grid-template-columns: 300px 1fr 290px 320px;
@@ -928,6 +1040,30 @@ TEMPLATE = r"""
       padding: 24px;
       position: relative;
       z-index: 2;
+      max-width: 100%;
+    }
+    .mobile-switcher {
+      display: none;
+    }
+    .mobile-header-menu-btn {
+      display: none;
+    }
+    .desktop-header-actions {
+      display: inline-flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .mobile-actions-drawer {
+      display: none;
+    }
+    .mobile-switcher button .icon {
+      display: none;
+      font-size: 14px;
+      line-height: 1;
+    }
+    .mobile-switcher button .label {
+      display: inline;
     }
     .panel {
       background: var(--card);
@@ -1107,6 +1243,7 @@ TEMPLATE = r"""
       align-items: center;
       gap: 12px;
       position: relative;
+      min-width: 0;
     }
     .theme-picker {
       display: flex;
@@ -1150,6 +1287,12 @@ TEMPLATE = r"""
     .theme-swatch[data-theme="orbit"] { background: linear-gradient(120deg, #60a5fa, #34d399); }
     .theme-swatch[data-theme="plasma"] { background: linear-gradient(120deg, #ec4899, #f59e0b); }
     .theme-swatch[data-theme="meteor"] { background: linear-gradient(120deg, #f97316, #22d3ee); }
+    .theme-swatch[data-theme="gdimp"] {
+      background-image: url("/assets/GDIMP.jpg");
+      background-size: cover;
+      background-position: center;
+      border-radius: 4px;
+    }
     .theme-select { display: none; }
     .effects-menu-btn {
       border: 1px solid var(--border);
@@ -1348,9 +1491,166 @@ TEMPLATE = r"""
       .layout .panel.provider-panel { order: 4; grid-column: 1 / -1; }
     }
     @media (max-width: 980px) {
+      header {
+        padding: 12px;
+        gap: 10px;
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .sub {
+        font-size: 11px;
+      }
+      header > .row {
+        justify-content: space-between;
+      }
+      .desktop-header-actions {
+        display: none;
+      }
+      .mobile-header-menu-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .mobile-actions-drawer {
+        position: fixed;
+        inset: 0;
+        z-index: 40;
+        display: none;
+        background: rgba(5, 8, 14, 0.64);
+        align-items: flex-start;
+        justify-content: center;
+        padding: 14px 12px;
+        overflow-y: auto;
+        overflow-x: hidden;
+      }
+      .mobile-actions-drawer.open {
+        display: flex;
+      }
+      .mobile-actions-card {
+        width: 100%;
+        max-width: 520px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background: var(--card);
+        box-shadow: 0 16px 28px rgba(0, 0, 0, 0.4);
+        padding: 10px;
+        display: grid;
+        gap: 8px;
+        overflow-x: hidden;
+      }
+      .mobile-actions-row {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: 1fr;
+      }
+      .mobile-actions-row > * {
+        min-width: 0;
+      }
+      .mobile-actions-card .btn,
+      .mobile-actions-card form .btn {
+        width: 100%;
+        justify-content: center;
+        white-space: normal;
+      }
+      .mobile-actions-card form {
+        margin: 0;
+        width: 100%;
+      }
+      .theme-control {
+        width: 100%;
+        justify-content: space-between;
+      }
+      .theme-picker {
+        max-width: 100%;
+        overflow-x: hidden;
+        flex-wrap: wrap;
+      }
+      .theme-option {
+        flex: 0 0 auto;
+      }
       .layout { grid-template-columns: 1fr; }
       .help-grid { grid-template-columns: 1fr; }
       .layout .panel.provider-panel { grid-column: auto; }
+      .layout {
+        padding: 12px;
+        gap: 12px;
+      }
+      .layout > .panel {
+        display: none;
+      }
+      .layout > .panel.mobile-active {
+        display: block;
+      }
+      .mobile-switcher {
+        position: fixed;
+        left: 10px;
+        right: 10px;
+        bottom: 10px;
+        z-index: 30;
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+        padding: 8px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background: rgba(7, 10, 16, 0.9);
+        backdrop-filter: blur(12px);
+        box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
+      }
+      .mobile-switcher button {
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--muted);
+        border-radius: 10px;
+        padding: 8px 6px;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .mobile-switcher button.active {
+        color: #041015;
+        border-color: transparent;
+        background: linear-gradient(120deg, var(--accent), var(--accent-2));
+      }
+      body {
+        padding-bottom: 84px;
+      }
+    }
+    @media (max-width: 420px) {
+      .brand {
+        font-size: 19px;
+      }
+      .mobile-switcher {
+        left: 8px;
+        right: 8px;
+        bottom: 8px;
+        gap: 6px;
+        padding: 6px;
+      }
+      .mobile-switcher button {
+        padding: 8px 4px;
+        font-size: 11px;
+      }
+      .mobile-switcher button .icon {
+        display: inline;
+      }
+      .mobile-switcher button .label {
+        display: none;
+      }
+      .row {
+        gap: 8px;
+      }
+      .btn {
+        padding: 8px 12px;
+      }
+      .panel {
+        padding: 12px;
+      }
+      .gdimp-video-wrap {
+        right: 8px;
+        bottom: 84px;
+        width: calc(100vw - 16px);
+      }
     }
     @media (prefers-reduced-motion: reduce) {
       * {
@@ -1362,6 +1662,17 @@ TEMPLATE = r"""
 </head>
 <body>
   <div id="fx_layer" class="fx-layer" aria-hidden="true"></div>
+  <div class="gdimp-video-wrap" aria-label="GDIMP theme video">
+    <button type="button" class="gdimp-video-close" id="gdimp_video_close_btn" aria-label="Close theme video">X</button>
+    <iframe
+      id="gdimp_video_frame"
+      class="gdimp-video-frame"
+      data-src="https://www.youtube.com/embed/_VRTa81j_cY?autoplay=1&mute=1&loop=1&playlist=_VRTa81j_cY"
+      title="Graphics Design Is My Passion"
+      allow="autoplay; encrypted-media; picture-in-picture"
+      allowfullscreen
+    ></iframe>
+  </div>
   <div id="conn_toast" class="conn-toast" aria-live="polite">
     <span id="conn_toast_icon" class="icon">✓</span>
     <span id="conn_toast_text"></span>
@@ -1389,6 +1700,7 @@ TEMPLATE = r"""
           <button type="button" class="theme-option" data-theme="orbit"><span class="theme-swatch" data-theme="orbit"></span></button>
           <button type="button" class="theme-option" data-theme="plasma"><span class="theme-swatch" data-theme="plasma"></span></button>
           <button type="button" class="theme-option" data-theme="meteor"><span class="theme-swatch" data-theme="meteor"></span></button>
+          <button type="button" class="theme-option" data-theme="gdimp"><span class="theme-swatch" data-theme="gdimp"></span></button>
         </div>
         <select id="theme_select" class="theme-select" aria-hidden="true" tabindex="-1">
           <option value="system">System</option>
@@ -1406,6 +1718,7 @@ TEMPLATE = r"""
           <option value="orbit">Orbit</option>
           <option value="plasma">Plasma</option>
           <option value="meteor">Meteor</option>
+          <option value="gdimp">GDIMP</option>
         </select>
         <button class="effects-menu-btn" id="effects_menu_btn" type="button" data-tip="Toggle ambient visual effects for the selected theme.">Effects</button>
         <div class="effects-panel" id="effects_panel">
@@ -1416,17 +1729,44 @@ TEMPLATE = r"""
           <div class="hint" style="margin-top: 8px;">Warm themes use comets and sparks. Cool themes use stars.</div>
         </div>
       </div>
-      <button class="btn ghost" type="button" onclick="toggleOnboard(true)">Guide</button>
-      <button class="btn ghost help-btn" type="button" onclick="toggleHelp(true)" title="Help">?</button>
-      <button class="btn ghost" type="button" onclick="saveOC()" data-tip="Save your current OC fields now.">Save</button>
-      <form method="post" action="{{ url_for('create_oc_route') }}">
-        <button class="btn secondary" type="submit">New OC</button>
-      </form>
+      <div class="desktop-header-actions">
+        <button class="btn ghost" type="button" onclick="toggleOnboard(true)">Guide</button>
+        <button class="btn ghost help-btn" type="button" onclick="toggleHelp(true)" title="Help">?</button>
+        <button class="btn ghost" type="button" onclick="saveOC()" data-tip="Save your current OC fields now.">Save</button>
+        <form method="post" action="{{ url_for('create_oc_route') }}">
+          <button class="btn secondary" type="submit">New OC</button>
+        </form>
+      </div>
+      <button class="btn ghost mobile-header-menu-btn" id="mobile_actions_btn" type="button" aria-expanded="false" aria-controls="mobile_actions_drawer">More</button>
     </div>
   </header>
 
+  <div class="mobile-actions-drawer" id="mobile_actions_drawer" aria-hidden="true">
+    <div class="mobile-actions-card">
+      <div class="row" style="justify-content: space-between;">
+        <strong>Quick Actions</strong>
+        <button class="btn ghost" type="button" id="mobile_actions_close_btn">Close</button>
+      </div>
+      <div class="mobile-actions-row">
+        <button class="btn ghost" type="button" onclick="toggleOnboard(true); setMobileActionsOpen(false);">Guide</button>
+        <button class="btn ghost" type="button" onclick="toggleHelp(true); setMobileActionsOpen(false);">Help</button>
+        <button class="btn ghost" type="button" onclick="saveOC(); setMobileActionsOpen(false);">Save</button>
+        <form method="post" action="{{ url_for('create_oc_route') }}">
+          <button class="btn secondary" type="submit">New OC</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <nav class="mobile-switcher" id="mobile_switcher" aria-label="Mobile quick sections">
+    <button type="button" data-mobile-target="editor" aria-label="Editor panel"><span class="icon">✎</span><span class="label">Editor</span></button>
+    <button type="button" data-mobile-target="ai" aria-label="AI settings panel"><span class="icon">⚙</span><span class="label">AI</span></button>
+    <button type="button" data-mobile-target="library" aria-label="OC library panel"><span class="icon">☰</span><span class="label">Library</span></button>
+    <button type="button" data-mobile-target="vault" aria-label="Provider vault panel"><span class="icon">⌁</span><span class="label">Vault</span></button>
+  </nav>
+
   <div class="layout">
-    <aside class="panel">
+    <aside class="panel" id="panel_ai" data-panel-name="ai">
       <h3>AI Settings</h3>
       <div class="grid">
         <div>
@@ -1490,7 +1830,7 @@ TEMPLATE = r"""
       </div>
     </aside>
 
-    <main class="panel">
+    <main class="panel" id="panel_editor" data-panel-name="editor">
       <div class="grid">
         <div>
           <label>OC Name</label>
@@ -1552,7 +1892,7 @@ TEMPLATE = r"""
       </div>
     </main>
 
-    <aside class="panel library-panel">
+    <aside class="panel library-panel" id="panel_library" data-panel-name="library">
       <h3>OC Library</h3>
       <div class="list" style="margin-bottom: 16px;">
         {% for item in ocs %}
@@ -1576,7 +1916,7 @@ TEMPLATE = r"""
       </div>
     </aside>
 
-    <aside class="panel provider-panel">
+    <aside class="panel provider-panel" id="panel_vault" data-panel-name="vault">
       <h3>Provider Vault</h3>
       <div class="grid">
         <input type="hidden" id="vault_id" />
@@ -1730,9 +2070,16 @@ TEMPLATE = r"""
     const helpStatusHintEl = document.getElementById('help_status_hint');
     const themeSelect = document.getElementById('theme_select');
     const themeButtons = document.querySelectorAll('.theme-option');
+    const mobileActionsBtnEl = document.getElementById('mobile_actions_btn');
+    const mobileActionsDrawerEl = document.getElementById('mobile_actions_drawer');
+    const mobileActionsCloseBtnEl = document.getElementById('mobile_actions_close_btn');
+    const mobileSwitcherEl = document.getElementById('mobile_switcher');
     const connToastEl = document.getElementById('conn_toast');
     const connToastIconEl = document.getElementById('conn_toast_icon');
     const connToastTextEl = document.getElementById('conn_toast_text');
+    const gdimpVideoWrapEl = document.querySelector('.gdimp-video-wrap');
+    const gdimpVideoFrameEl = document.getElementById('gdimp_video_frame');
+    const gdimpVideoCloseBtnEl = document.getElementById('gdimp_video_close_btn');
     const fxLayerEl = document.getElementById('fx_layer');
     const effectsMenuBtnEl = document.getElementById('effects_menu_btn');
     const effectsPanelEl = document.getElementById('effects_panel');
@@ -1757,6 +2104,7 @@ TEMPLATE = r"""
     const HELP_MODE_KEY = 'ocreator_help_mode';
     const HELP_MODEL_KEY = 'ocreator_help_model';
     const EFFECTS_ENABLED_KEY = 'ocreator_effects_enabled';
+    const MOBILE_PANEL_KEY = 'ocreator_mobile_panel';
 
     let activeThemeName = 'system';
     let confirmResolver = null;
@@ -1792,8 +2140,72 @@ TEMPLATE = r"""
       setMode(current);
     }
 
+    function setMobilePanel(name) {
+      const target = name || 'editor';
+      document.querySelectorAll('.layout > .panel').forEach((panel) => {
+        panel.classList.toggle('mobile-active', panel.dataset.panelName === target);
+      });
+      if (!mobileSwitcherEl) return;
+      mobileSwitcherEl.querySelectorAll('button[data-mobile-target]').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.mobileTarget === target);
+      });
+    }
+
+    function initMobilePanels() {
+      const media = window.matchMedia('(max-width: 980px)');
+      if (mobileSwitcherEl) {
+        mobileSwitcherEl.querySelectorAll('button[data-mobile-target]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const next = btn.dataset.mobileTarget || 'editor';
+            localStorage.setItem(MOBILE_PANEL_KEY, next);
+            setMobilePanel(next);
+          });
+        });
+      }
+      const apply = () => {
+        if (media.matches) {
+          const saved = localStorage.getItem(MOBILE_PANEL_KEY) || 'editor';
+          setMobilePanel(saved);
+          return;
+        }
+        document.querySelectorAll('.layout > .panel').forEach((panel) => panel.classList.remove('mobile-active'));
+      };
+      apply();
+      if (media.addEventListener) {
+        media.addEventListener('change', apply);
+      } else if (media.addListener) {
+        media.addListener(apply);
+      }
+    }
+
     function initTemplate() {
       templateMode.value = "{{ oc.template_mode }}";
+    }
+
+    function setMobileActionsOpen(show) {
+      if (!mobileActionsDrawerEl || !mobileActionsBtnEl) return;
+      mobileActionsDrawerEl.classList.toggle('open', show);
+      mobileActionsDrawerEl.setAttribute('aria-hidden', show ? 'false' : 'true');
+      mobileActionsBtnEl.setAttribute('aria-expanded', show ? 'true' : 'false');
+    }
+
+    function initMobileActions() {
+      if (!mobileActionsBtnEl || !mobileActionsDrawerEl) return;
+      mobileActionsBtnEl.addEventListener('click', () => {
+        const open = !mobileActionsDrawerEl.classList.contains('open');
+        setMobileActionsOpen(open);
+      });
+      if (mobileActionsCloseBtnEl) {
+        mobileActionsCloseBtnEl.addEventListener('click', () => setMobileActionsOpen(false));
+      }
+      mobileActionsDrawerEl.addEventListener('click', (event) => {
+        if (event.target === mobileActionsDrawerEl) setMobileActionsOpen(false);
+      });
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && mobileActionsDrawerEl.classList.contains('open')) {
+          setMobileActionsOpen(false);
+        }
+      });
     }
 
     function collectPayload() {
@@ -2282,6 +2694,15 @@ TEMPLATE = r"""
       } else {
         document.documentElement.setAttribute('data-theme', next);
       }
+      if (gdimpVideoFrameEl) {
+        const videoSrc = gdimpVideoFrameEl.dataset.src || '';
+        if (next === 'gdimp') {
+          if (gdimpVideoWrapEl) gdimpVideoWrapEl.classList.remove('hidden-by-user');
+          if (gdimpVideoFrameEl.src !== videoSrc) gdimpVideoFrameEl.src = videoSrc;
+        } else {
+          gdimpVideoFrameEl.src = '';
+        }
+      }
       localStorage.setItem('theme', next);
       if (themeSelect) themeSelect.value = next;
       themeButtons.forEach((btn) => {
@@ -2500,6 +2921,12 @@ TEMPLATE = r"""
         if (event.target === confirmModalEl) resolveConfirm(false);
       });
     }
+    if (gdimpVideoCloseBtnEl) {
+      gdimpVideoCloseBtnEl.addEventListener('click', () => {
+        if (gdimpVideoFrameEl) gdimpVideoFrameEl.src = '';
+        if (gdimpVideoWrapEl) gdimpVideoWrapEl.classList.add('hidden-by-user');
+      });
+    }
 
     function startAutosave() {
       setInterval(() => {
@@ -2509,6 +2936,8 @@ TEMPLATE = r"""
     }
 
     initMode();
+    initMobileActions();
+    initMobilePanels();
     initTemplate();
     initTheme();
     initEffectsPanel();
