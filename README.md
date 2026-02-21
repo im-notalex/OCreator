@@ -2,7 +2,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Flask](https://img.shields.io/badge/Flask-App-000000?logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
-[![License](https://img.shields.io/badge/License-MIT-22c55e.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 ![Local First](https://img.shields.io/badge/Storage-Local%20First-0ea5e9)
 
 **OCreator is a local-first OC persona builder. Create a playable character from a prompt, clean up an existing persona, or enhance a draft, all as a single text output for platforms like Chub or Janitor.**
