@@ -16,11 +16,15 @@ You represent that:
 
 ## 2. Copyright License Grant
 
-You grant the Project Maintainer and all recipients of this project a perpetual, worldwide, non-exclusive, royalty-free, irrevocable license to use, reproduce, modify, prepare derivative works of, publicly display, publicly perform, distribute, sublicense, and otherwise exploit your contribution as part of this project.
+You retain copyright ownership of your contribution.
+
+You grant the Project Maintainer a perpetual, worldwide, non-exclusive, royalty-free, irrevocable license to use, reproduce, modify, prepare derivative works of, publicly display, publicly perform, distribute, sublicense, and otherwise exploit your contribution, and to license your contribution under any terms, including AGPL, other open-source licenses, and proprietary or commercial licenses.
+
+You also grant each recipient of your contribution the rights granted by the license terms that accompany the copy they receive from the Project Maintainer.
 
 ## 3. Patent License Grant
 
-To the extent you own or control patent claims necessarily infringed by your contribution, you grant the Project Maintainer and recipients a perpetual, worldwide, non-exclusive, royalty-free, irrevocable patent license to make, have made, use, sell, offer for sale, import, and otherwise transfer the contribution as part of this project.
+To the extent you own or control patent claims necessarily infringed by your contribution, you grant the Project Maintainer and recipients a perpetual, worldwide, non-exclusive, royalty-free, irrevocable patent license to make, have made, use, sell, offer for sale, import, and otherwise transfer your contribution under the license terms that accompany the copy they receive.
 
 ## 4. No Warranty
 
@@ -31,6 +35,8 @@ Your contribution is provided "as is," without warranties or conditions of any k
 This CLA applies to all past and future contributions you submit to this repository.
 
 The project is licensed under the GNU AGPL v3 (see `LICENSE`). This CLA does not replace the AGPL v3; it defines the rights you grant for contributed material.
+
+The Project Maintainer may also offer this project, including contributions, under additional open-source or proprietary license terms.
 
 ## Acceptance
 
