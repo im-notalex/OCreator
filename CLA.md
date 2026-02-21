@@ -2,6 +2,10 @@
 
 This CLA applies to any contribution you submit to this repository, including code, documentation, designs, assets, and other material.
 
+## Project Maintainer
+
+For this CLA, "Project Maintainer" means the GitHub user `@im-notalex` (`https://github.com/im-notalex`) and any maintainers they designate for this repository.
+
 ## 1. Your Rights to Contribute
 
 You represent that:
@@ -12,11 +16,11 @@ You represent that:
 
 ## 2. Copyright License Grant
 
-You grant the project maintainers and all recipients of this project a perpetual, worldwide, non-exclusive, royalty-free, irrevocable license to use, reproduce, modify, prepare derivative works of, publicly display, publicly perform, distribute, sublicense, and otherwise exploit your contribution as part of this project.
+You grant the Project Maintainer and all recipients of this project a perpetual, worldwide, non-exclusive, royalty-free, irrevocable license to use, reproduce, modify, prepare derivative works of, publicly display, publicly perform, distribute, sublicense, and otherwise exploit your contribution as part of this project.
 
 ## 3. Patent License Grant
 
-To the extent you own or control patent claims necessarily infringed by your contribution, you grant the project maintainers and recipients a perpetual, worldwide, non-exclusive, royalty-free, irrevocable patent license to make, have made, use, sell, offer for sale, import, and otherwise transfer the contribution as part of this project.
+To the extent you own or control patent claims necessarily infringed by your contribution, you grant the Project Maintainer and recipients a perpetual, worldwide, non-exclusive, royalty-free, irrevocable patent license to make, have made, use, sell, offer for sale, import, and otherwise transfer the contribution as part of this project.
 
 ## 4. No Warranty
 
