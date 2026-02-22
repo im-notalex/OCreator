@@ -162,12 +162,54 @@ def username_key(username: str) -> str:
     return str(username or "").strip().lower()
 
 
-def slugify_username(username: str) -> str:
+def new_user_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def user_folder_from_id(user_id: str) -> str:
+    cleaned = "".join(ch for ch in str(user_id or "").strip().lower() if ch.isalnum())
+    return cleaned or new_user_id()
+
+
+def legacy_folder_from_username(username: str) -> str:
     base = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in username.strip().lower())
-    base = base.strip("_")
-    if not base:
-        base = f"user_{uuid.uuid4().hex[:8]}"
-    return base
+    return base.strip("_")
+
+
+def ensure_unique_user_id(users: List[Dict[str, Any]], preferred: str = "") -> str:
+    existing = {str(item.get("id", "") or "").strip().lower() for item in users if isinstance(item, dict)}
+    if preferred:
+        candidate = "".join(ch for ch in str(preferred).strip().lower() if ch.isalnum())
+        if candidate and candidate not in existing:
+            return candidate
+    candidate = new_user_id()
+    while candidate in existing:
+        candidate = new_user_id()
+    return candidate
+
+
+def migrate_user_folder(old_folder: str, new_folder: str) -> None:
+    old_name = str(old_folder or "").strip()
+    new_name = str(new_folder or "").strip()
+    if not old_name or not new_name or old_name == new_name:
+        return
+    old_path = USER_DATA_DIR / old_name
+    new_path = USER_DATA_DIR / new_name
+    if not old_path.exists() or not old_path.is_dir():
+        return
+    new_path.mkdir(parents=True, exist_ok=True)
+    for filename in ("ocs.json", "settings.json", "providers.json"):
+        src = old_path / filename
+        dst = new_path / filename
+        if src.exists() and not dst.exists():
+            try:
+                shutil.move(str(src), str(dst))
+            except Exception:
+                pass
+    try:
+        old_path.rmdir()
+    except Exception:
+        pass
 
 
 def load_security_config() -> Dict[str, Any]:
@@ -189,17 +231,33 @@ def load_users_db() -> Dict[str, Any]:
     users = raw.get("users", []) if isinstance(raw, dict) else []
     if not isinstance(users, list):
         users = []
+    ensure_dirs()
     normalized: List[Dict[str, Any]] = []
+    changed = False
     for item in users:
         if not isinstance(item, dict):
+            changed = True
             continue
         username = str(item.get("username", "") or "").strip()
         password_hash = str(item.get("password_hash", "") or "").strip()
         if not username or not password_hash:
+            changed = True
             continue
-        folder = str(item.get("folder", "") or "").strip() or slugify_username(username)
+        user_id = ensure_unique_user_id(normalized, str(item.get("id", "") or ""))
+        folder = user_folder_from_id(user_id)
+        old_folder = str(item.get("folder", "") or "").strip()
+        if not old_folder:
+            old_folder = legacy_folder_from_username(username)
+        if old_folder and old_folder != folder:
+            migrate_user_folder(old_folder, folder)
+            changed = True
+        if str(item.get("id", "") or "").strip().lower() != user_id:
+            changed = True
+        if old_folder != folder:
+            changed = True
         normalized.append(
             {
+                "id": user_id,
                 "username": username,
                 "password_hash": password_hash,
                 "folder": folder,
@@ -207,6 +265,8 @@ def load_users_db() -> Dict[str, Any]:
                 "updated_at": str(item.get("updated_at", "") or ""),
             }
         )
+    if changed:
+        save_users_db({"users": normalized})
     return {"users": normalized}
 
 
@@ -242,7 +302,8 @@ def security_enabled() -> bool:
 
 
 def user_data_dir(user: Dict[str, Any]) -> Path:
-    folder = str(user.get("folder", "") or "").strip() or slugify_username(str(user.get("username", "") or "user"))
+    user_id = str(user.get("id", "") or "").strip()
+    folder = str(user.get("folder", "") or "").strip() or user_folder_from_id(user_id or new_user_id())
     path = USER_DATA_DIR / folder
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -290,27 +351,6 @@ def validate_password(password: str) -> Optional[str]:
     return None
 
 
-def find_user_by_folder(users: List[Dict[str, Any]], folder: str, exclude_key: str = "") -> Optional[Dict[str, Any]]:
-    target = str(folder or "").strip().lower()
-    for user in users:
-        key = username_key(str(user.get("username", "")))
-        if exclude_key and key == exclude_key:
-            continue
-        if str(user.get("folder", "") or "").strip().lower() == target:
-            return user
-    return None
-
-
-def ensure_unique_user_folder(username: str, users: List[Dict[str, Any]], exclude_key: str = "") -> str:
-    base = slugify_username(username)
-    candidate = base
-    index = 2
-    while find_user_by_folder(users, candidate, exclude_key=exclude_key):
-        candidate = f"{base}_{index}"
-        index += 1
-    return candidate
-
-
 def save_user_credentials(username: str, password: str, copy_legacy_if_first: bool = True) -> Dict[str, Any]:
     users_db = load_users_db()
     users = users_db.get("users", [])
@@ -321,15 +361,18 @@ def save_user_credentials(username: str, password: str, copy_legacy_if_first: bo
             user["username"] = username.strip()
             user["password_hash"] = generate_password_hash(password)
             user["updated_at"] = now
-            if not user.get("folder"):
-                user["folder"] = ensure_unique_user_folder(user["username"], users, exclude_key=key)
+            if not str(user.get("id", "") or "").strip():
+                user["id"] = ensure_unique_user_id(users)
+            user["folder"] = user_folder_from_id(str(user.get("id", "") or ""))
             save_users_db(users_db)
             user_data_dir(user)
             return user
 
     is_first_user = len(users) == 0
-    folder = ensure_unique_user_folder(username, users)
+    user_id = ensure_unique_user_id(users)
+    folder = user_folder_from_id(user_id)
     user = {
+        "id": user_id,
         "username": username.strip(),
         "password_hash": generate_password_hash(password),
         "folder": folder,
