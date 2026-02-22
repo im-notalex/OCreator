@@ -1,12 +1,26 @@
 import json
 import os
+import secrets
+import shutil
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
-from flask import Flask, Response, jsonify, redirect, render_template_string, request, send_from_directory, url_for
+from flask import (
+    Flask,
+    Response,
+    has_request_context,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    send_from_directory,
+    session,
+    url_for,
+)
+from werkzeug.security import check_password_hash, generate_password_hash
 
 APP_TITLE = "OCreator"
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -14,6 +28,10 @@ ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 DB_PATH = DATA_DIR / "ocs.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 PROVIDERS_PATH = DATA_DIR / "providers.json"
+SECURITY_DIR = DATA_DIR / "security"
+SECURITY_CONFIG_PATH = SECURITY_DIR / "config.json"
+USERS_PATH = SECURITY_DIR / "users.json"
+USER_DATA_DIR = DATA_DIR / "users"
 
 PROVIDERS = [
     {"id": "openai", "label": "OpenAI"},
@@ -40,10 +58,19 @@ DEFAULT_SETTINGS = {
     "base_url": PROVIDER_DEFAULTS["openai"]["base_url"],
     "temperature": 0.7,
     "max_tokens": 1200,
+    "pre_cut_enabled": False,
+    "pre_cut_markers": "",
+    "pre_cut_replace_enabled": False,
+    "pre_cut_replace_rules": "",
 }
 
 MIN_TEMPERATURE = 0.0
 MAX_TEMPERATURE = 2.0
+MAX_PRE_CUT_TEXT_LEN = 12000
+MAX_PRE_CUT_RULE_LINES = 200
+
+DEFAULT_SECURITY_CONFIG = {"enabled": False}
+DEFAULT_USERS_DB = {"users": []}
 
 DEFAULT_TEMPLATE = "\n".join(
     [
@@ -90,6 +117,12 @@ DEFAULT_PROVIDER_PROFILE = {
 }
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("OCREATOR_SECRET_KEY", "") or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(days=14),
+)
 
 
 def now_iso() -> str:
@@ -98,6 +131,8 @@ def now_iso() -> str:
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SECURITY_DIR.mkdir(parents=True, exist_ok=True)
+    USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -111,6 +146,299 @@ def load_json(path: Path, default: Any) -> Any:
 
 def save_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    return False
+
+
+def username_key(username: str) -> str:
+    return str(username or "").strip().lower()
+
+
+def slugify_username(username: str) -> str:
+    base = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in username.strip().lower())
+    base = base.strip("_")
+    if not base:
+        base = f"user_{uuid.uuid4().hex[:8]}"
+    return base
+
+
+def load_security_config() -> Dict[str, Any]:
+    raw = load_json(SECURITY_CONFIG_PATH, DEFAULT_SECURITY_CONFIG.copy())
+    config = DEFAULT_SECURITY_CONFIG.copy()
+    if isinstance(raw, dict):
+        config.update(raw)
+    config["enabled"] = parse_bool(config.get("enabled"))
+    return config
+
+
+def save_security_config(config: Dict[str, Any]) -> None:
+    payload = {"enabled": parse_bool(config.get("enabled", False)), "updated_at": now_iso()}
+    save_json(SECURITY_CONFIG_PATH, payload)
+
+
+def load_users_db() -> Dict[str, Any]:
+    raw = load_json(USERS_PATH, DEFAULT_USERS_DB.copy())
+    users = raw.get("users", []) if isinstance(raw, dict) else []
+    if not isinstance(users, list):
+        users = []
+    normalized: List[Dict[str, Any]] = []
+    for item in users:
+        if not isinstance(item, dict):
+            continue
+        username = str(item.get("username", "") or "").strip()
+        password_hash = str(item.get("password_hash", "") or "").strip()
+        if not username or not password_hash:
+            continue
+        folder = str(item.get("folder", "") or "").strip() or slugify_username(username)
+        normalized.append(
+            {
+                "username": username,
+                "password_hash": password_hash,
+                "folder": folder,
+                "created_at": str(item.get("created_at", "") or ""),
+                "updated_at": str(item.get("updated_at", "") or ""),
+            }
+        )
+    return {"users": normalized}
+
+
+def save_users_db(users_db: Dict[str, Any]) -> None:
+    users = users_db.get("users", []) if isinstance(users_db, dict) else []
+    if not isinstance(users, list):
+        users = []
+    save_json(USERS_PATH, {"users": users})
+
+
+def find_user(username: str) -> Optional[Dict[str, Any]]:
+    key = username_key(username)
+    if not key:
+        return None
+    users = load_users_db().get("users", [])
+    for user in users:
+        if username_key(str(user.get("username", ""))) == key:
+            return user
+    return None
+
+
+def get_session_user() -> Optional[Dict[str, Any]]:
+    if not has_request_context():
+        return None
+    username = str(session.get("username", "") or "").strip()
+    if not username:
+        return None
+    return find_user(username)
+
+
+def security_enabled() -> bool:
+    return bool(load_security_config().get("enabled", False))
+
+
+def user_data_dir(user: Dict[str, Any]) -> Path:
+    folder = str(user.get("folder", "") or "").strip() or slugify_username(str(user.get("username", "") or "user"))
+    path = USER_DATA_DIR / folder
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def current_data_paths() -> Dict[str, Path]:
+    if security_enabled() and has_request_context():
+        user = get_session_user()
+        if user:
+            root = user_data_dir(user)
+            return {
+                "db": root / "ocs.json",
+                "settings": root / "settings.json",
+                "providers": root / "providers.json",
+            }
+    return {"db": DB_PATH, "settings": SETTINGS_PATH, "providers": PROVIDERS_PATH}
+
+
+def copy_legacy_data_into_user(user: Dict[str, Any]) -> None:
+    target_root = user_data_dir(user)
+    for legacy_path, target_name in ((DB_PATH, "ocs.json"), (SETTINGS_PATH, "settings.json"), (PROVIDERS_PATH, "providers.json")):
+        target = target_root / target_name
+        if legacy_path.exists() and not target.exists():
+            shutil.copy2(legacy_path, target)
+
+
+def validate_username(username: str) -> Optional[str]:
+    value = str(username or "").strip()
+    if len(value) < 3:
+        return "Username must be at least 3 characters."
+    if len(value) > 64:
+        return "Username is too long."
+    if any(ch.isspace() for ch in value):
+        return "Username cannot include spaces."
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+    if any(ch not in allowed for ch in value):
+        return "Username can only use letters, numbers, - and _."
+    return None
+
+
+def validate_password(password: str) -> Optional[str]:
+    value = str(password or "")
+    if len(value) < 8:
+        return "Password must be at least 8 characters."
+    return None
+
+
+def find_user_by_folder(users: List[Dict[str, Any]], folder: str, exclude_key: str = "") -> Optional[Dict[str, Any]]:
+    target = str(folder or "").strip().lower()
+    for user in users:
+        key = username_key(str(user.get("username", "")))
+        if exclude_key and key == exclude_key:
+            continue
+        if str(user.get("folder", "") or "").strip().lower() == target:
+            return user
+    return None
+
+
+def ensure_unique_user_folder(username: str, users: List[Dict[str, Any]], exclude_key: str = "") -> str:
+    base = slugify_username(username)
+    candidate = base
+    index = 2
+    while find_user_by_folder(users, candidate, exclude_key=exclude_key):
+        candidate = f"{base}_{index}"
+        index += 1
+    return candidate
+
+
+def save_user_credentials(username: str, password: str, copy_legacy_if_first: bool = True) -> Dict[str, Any]:
+    users_db = load_users_db()
+    users = users_db.get("users", [])
+    key = username_key(username)
+    now = now_iso()
+    for user in users:
+        if username_key(str(user.get("username", ""))) == key:
+            user["username"] = username.strip()
+            user["password_hash"] = generate_password_hash(password)
+            user["updated_at"] = now
+            if not user.get("folder"):
+                user["folder"] = ensure_unique_user_folder(user["username"], users, exclude_key=key)
+            save_users_db(users_db)
+            user_data_dir(user)
+            return user
+
+    is_first_user = len(users) == 0
+    folder = ensure_unique_user_folder(username, users)
+    user = {
+        "username": username.strip(),
+        "password_hash": generate_password_hash(password),
+        "folder": folder,
+        "created_at": now,
+        "updated_at": now,
+    }
+    users.append(user)
+    save_users_db(users_db)
+    user_data_dir(user)
+    if copy_legacy_if_first and is_first_user:
+        copy_legacy_data_into_user(user)
+    return user
+
+
+def verify_user_credentials(username: str, password: str) -> bool:
+    user = find_user(username)
+    if not user:
+        return False
+    password_hash = str(user.get("password_hash", "") or "")
+    if not password_hash:
+        return False
+    return check_password_hash(password_hash, password)
+
+
+def parse_pre_cut_replace_rules(raw: str) -> List[tuple[str, str]]:
+    rules: List[tuple[str, str]] = []
+    if not raw:
+        return rules
+    lines = str(raw).replace("\r\n", "\n").split("\n")
+    for line in lines[:MAX_PRE_CUT_RULE_LINES]:
+        text = line.strip()
+        if not text:
+            continue
+        if "=>" in text:
+            source, target = text.split("=>", 1)
+        elif "->" in text:
+            source, target = text.split("->", 1)
+        else:
+            continue
+        source = source.strip()
+        if not source:
+            continue
+        rules.append((source, target.strip()))
+    return rules
+
+
+def apply_pre_cut(text: str, settings: Dict[str, Any]) -> tuple[str, bool]:
+    content = sanitize_text(text)
+    changed = False
+
+    if parse_bool(settings.get("pre_cut_enabled", False)):
+        markers_raw = str(settings.get("pre_cut_markers", "") or "")
+        markers = [line.strip() for line in markers_raw.replace("\r\n", "\n").split("\n") if line.strip()]
+        if markers:
+            lower_content = content.lower()
+            first_index: Optional[int] = None
+            for marker in markers:
+                idx = lower_content.find(marker.lower())
+                if idx >= 0 and (first_index is None or idx < first_index):
+                    first_index = idx
+            if first_index is not None:
+                content = content[:first_index].rstrip()
+                changed = True
+
+    if parse_bool(settings.get("pre_cut_replace_enabled", False)):
+        rules = parse_pre_cut_replace_rules(str(settings.get("pre_cut_replace_rules", "") or ""))
+        if rules:
+            for source, target in rules:
+                if source in content:
+                    content = content.replace(source, target)
+                    changed = True
+
+    return content, changed
+
+
+def is_api_request() -> bool:
+    path = request.path
+    if (
+        path.startswith("/oc/")
+        or path.startswith("/settings")
+        or path.startswith("/providers")
+        or path.startswith("/security/")
+    ):
+        return True
+    accept = (request.headers.get("Accept") or "").lower()
+    return "application/json" in accept
+
+
+@app.before_request
+def require_auth_if_enabled() -> Optional[Response]:
+    ensure_dirs()
+    if request.path.startswith("/assets/"):
+        return None
+    if request.endpoint in {"assets_route", "secure_login_route", "login_route"}:
+        return None
+    if not security_enabled():
+        return None
+    user = get_session_user()
+    if user:
+        session["username"] = user["username"]
+        session.permanent = True
+        return None
+    session.pop("username", None)
+    if is_api_request() or request.method == "POST":
+        return jsonify({"error": "Authentication required"}), 401
+    next_path = request.path
+    if request.query_string:
+        next_path = f"{request.path}?{request.query_string.decode('utf-8', errors='ignore')}"
+    return redirect(url_for("secure_login_route", next=next_path))
 
 
 def clamp_settings_values(settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -129,6 +457,16 @@ def clamp_settings_values(settings: Dict[str, Any]) -> Dict[str, Any]:
         max_tokens = int(settings.get("max_tokens", DEFAULT_SETTINGS["max_tokens"]))
     except Exception:
         max_tokens = DEFAULT_SETTINGS["max_tokens"]
+    pre_cut_enabled = parse_bool(settings.get("pre_cut_enabled", DEFAULT_SETTINGS["pre_cut_enabled"]))
+    pre_cut_markers = str(settings.get("pre_cut_markers", DEFAULT_SETTINGS["pre_cut_markers"]) or "")
+    pre_cut_replace_enabled = parse_bool(
+        settings.get("pre_cut_replace_enabled", DEFAULT_SETTINGS["pre_cut_replace_enabled"])
+    )
+    pre_cut_replace_rules = str(settings.get("pre_cut_replace_rules", DEFAULT_SETTINGS["pre_cut_replace_rules"]) or "")
+    if len(pre_cut_markers) > MAX_PRE_CUT_TEXT_LEN:
+        pre_cut_markers = pre_cut_markers[:MAX_PRE_CUT_TEXT_LEN]
+    if len(pre_cut_replace_rules) > MAX_PRE_CUT_TEXT_LEN:
+        pre_cut_replace_rules = pre_cut_replace_rules[:MAX_PRE_CUT_TEXT_LEN]
 
     return {
         "provider": provider,
@@ -137,11 +475,16 @@ def clamp_settings_values(settings: Dict[str, Any]) -> Dict[str, Any]:
         "base_url": str(settings.get("base_url", "") or "").strip() or defaults["base_url"],
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "pre_cut_enabled": pre_cut_enabled,
+        "pre_cut_markers": pre_cut_markers,
+        "pre_cut_replace_enabled": pre_cut_replace_enabled,
+        "pre_cut_replace_rules": pre_cut_replace_rules,
     }
 
 
 def load_settings() -> Dict[str, Any]:
-    settings = load_json(SETTINGS_PATH, DEFAULT_SETTINGS.copy())
+    settings_path = current_data_paths()["settings"]
+    settings = load_json(settings_path, DEFAULT_SETTINGS.copy())
     merged = DEFAULT_SETTINGS.copy()
     if isinstance(settings, dict):
         merged.update({k: v for k, v in settings.items() if v is not None})
@@ -149,11 +492,13 @@ def load_settings() -> Dict[str, Any]:
 
 
 def save_settings(settings: Dict[str, Any]) -> None:
-    save_json(SETTINGS_PATH, settings)
+    settings_path = current_data_paths()["settings"]
+    save_json(settings_path, settings)
 
 
 def load_provider_profiles() -> List[Dict[str, Any]]:
-    raw = load_json(PROVIDERS_PATH, {"providers": []})
+    providers_path = current_data_paths()["providers"]
+    raw = load_json(providers_path, {"providers": []})
     items = raw.get("providers", []) if isinstance(raw, dict) else []
     if not isinstance(items, list):
         return []
@@ -170,18 +515,21 @@ def load_provider_profiles() -> List[Dict[str, Any]]:
 
 
 def save_provider_profiles(profiles: List[Dict[str, Any]]) -> None:
-    save_json(PROVIDERS_PATH, {"providers": profiles})
+    providers_path = current_data_paths()["providers"]
+    save_json(providers_path, {"providers": profiles})
 
 
 def load_db() -> Dict[str, Any]:
-    db = load_json(DB_PATH, {"ocs": []})
+    db_path = current_data_paths()["db"]
+    db = load_json(db_path, {"ocs": []})
     if "ocs" not in db or not isinstance(db["ocs"], list):
         db["ocs"] = []
     return db
 
 
 def save_db(db: Dict[str, Any]) -> None:
-    save_json(DB_PATH, db)
+    db_path = current_data_paths()["db"]
+    save_json(db_path, db)
 
 
 def ensure_oc_defaults(oc: Dict[str, Any]) -> Dict[str, Any]:
@@ -389,6 +737,133 @@ def call_llm(settings: Dict[str, Any], prompt: str) -> str:
     raise RuntimeError("Unknown provider.")
 
 
+@app.route("/secure-login", methods=["GET", "POST"])
+def secure_login_route():
+    ensure_dirs()
+    next_path = str(request.args.get("next", "/") or "/")
+    if not next_path.startswith("/"):
+        next_path = "/"
+    users = load_users_db().get("users", [])
+    has_users = bool(users)
+    mode = "signup" if not has_users else "login"
+    current = get_session_user()
+    if current and security_enabled():
+        return redirect(next_path)
+
+    error = ""
+    prefill_username = ""
+    if request.method == "POST":
+        action = str(request.form.get("action", "login") or "login").strip().lower()
+        if action not in {"login", "signup"}:
+            action = "login"
+        username = str(request.form.get("username", "") or "").strip()
+        password = str(request.form.get("password", "") or "")
+        confirm = str(request.form.get("confirm", "") or "")
+        posted_next = str(request.form.get("next", "/") or "/")
+        if posted_next.startswith("/"):
+            next_path = posted_next
+        prefill_username = username
+        users = load_users_db().get("users", [])
+        has_users = bool(users)
+        if not has_users:
+            action = "signup"
+
+        if action == "signup":
+            username_error = validate_username(username)
+            password_error = validate_password(password)
+            if username_error:
+                error = username_error
+            elif password_error:
+                error = password_error
+            elif password != confirm:
+                error = "Passwords do not match."
+            elif find_user(username):
+                error = "Could not create account with that username."
+            else:
+                user = save_user_credentials(username, password, copy_legacy_if_first=not has_users)
+                session["username"] = user["username"]
+                session.permanent = True
+                if not security_enabled():
+                    save_security_config({"enabled": True})
+                return redirect(next_path)
+        else:
+            if not verify_user_credentials(username, password):
+                error = "Invalid username or password."
+            else:
+                user = find_user(username)
+                if not user:
+                    error = "Account no longer exists."
+                else:
+                    session["username"] = user["username"]
+                    session.permanent = True
+                    return redirect(next_path)
+
+    return render_template_string(
+        SECURE_LOGIN_TEMPLATE,
+        app_title=APP_TITLE,
+        error=error,
+        mode=mode,
+        has_users=has_users,
+        next_path=next_path,
+        username=prefill_username,
+    )
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login_route():
+    return redirect(url_for("secure_login_route", next=request.args.get("next", "/")))
+
+
+@app.route("/logout", methods=["POST"])
+def logout_route():
+    session.pop("username", None)
+    if security_enabled():
+        return redirect(url_for("secure_login_route"))
+    return redirect(url_for("index"))
+
+
+@app.route("/security/status")
+def security_status_route():
+    ensure_dirs()
+    current = get_session_user()
+    return jsonify(
+        {
+            "ok": True,
+            "enabled": security_enabled(),
+            "current_user": str(current.get("username", "") if current else ""),
+        }
+    )
+
+
+@app.route("/security/config", methods=["POST"])
+def security_config_route():
+    ensure_dirs()
+    payload = request.get_json(silent=True) or {}
+    enabled = parse_bool(payload.get("enabled", False))
+    users = load_users_db().get("users", [])
+    if enabled and not users:
+        return jsonify({"error": "Create at least one account from Secure Login first."}), 400
+    save_security_config({"enabled": enabled})
+    if not enabled:
+        session.pop("username", None)
+    return jsonify({"ok": True, "enabled": enabled})
+
+
+@app.route("/security/users/save", methods=["POST"])
+def security_save_user_route():
+    ensure_dirs()
+    current = get_session_user()
+    if not current:
+        return jsonify({"error": "Sign in first."}), 401
+    payload = request.get_json(silent=True) or {}
+    password = str(payload.get("password", "") or "")
+    password_error = validate_password(password)
+    if password_error:
+        return jsonify({"error": password_error}), 400
+    user = save_user_credentials(str(current.get("username", "") or ""), password, copy_legacy_if_first=False)
+    return jsonify({"ok": True, "current_user": str(user.get("username", "") or "")})
+
+
 @app.route("/")
 def index():
     ensure_dirs()
@@ -412,6 +887,7 @@ def edit_oc(oc_id: str):
     settings = load_settings()
     provider_profiles = load_provider_profiles()
     sorted_ocs = sort_ocs(db["ocs"])
+    current_user = get_session_user()
     return render_template_string(
         TEMPLATE,
         app_title=APP_TITLE,
@@ -422,6 +898,8 @@ def edit_oc(oc_id: str):
         provider_profiles=provider_profiles,
         provider_defaults=PROVIDER_DEFAULTS,
         default_template=DEFAULT_TEMPLATE,
+        security_enabled=security_enabled(),
+        current_username=str(current_user.get("username", "") if current_user else ""),
     )
 
 
@@ -538,6 +1016,7 @@ def generate_oc(oc_id: str):
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
     response = sanitize_text(response)
+    response, filtered = apply_pre_cut(response, settings)
     oc["result_text"] = response
     if not oc.get("name") or oc["name"] == "Untitled OC":
         first_line = response.splitlines()[0].strip()
@@ -547,7 +1026,7 @@ def generate_oc(oc_id: str):
                 oc["name"] = candidate
     oc["updated_at"] = now_iso()
     save_db(db)
-    return jsonify({"result": response, "name": oc.get("name", "")})
+    return jsonify({"result": response, "name": oc.get("name", ""), "filtered": filtered})
 
 
 @app.route("/oc/<oc_id>/quick-fix", methods=["POST"])
@@ -569,10 +1048,11 @@ def quick_fix_oc_route(oc_id: str):
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
     response = sanitize_text(response)
+    response, filtered = apply_pre_cut(response, settings)
     oc["result_text"] = response
     oc["updated_at"] = now_iso()
     save_db(db)
-    return jsonify({"ok": True, "result": response})
+    return jsonify({"ok": True, "result": response, "filtered": filtered})
 
 
 @app.route("/oc/<oc_id>/export")
@@ -675,6 +1155,202 @@ def test_settings_route():
             "preview": sanitize_text(result)[:120],
         }
     )
+
+
+SECURE_LOGIN_TEMPLATE = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ app_title }} - Secure Login</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #081018;
+      --bg2: #0e1724;
+      --card: rgba(16, 24, 38, 0.94);
+      --ink: #f5f7fb;
+      --muted: #97a3b6;
+      --accent: #37caa0;
+      --accent2: #5ea7ff;
+      --border: rgba(132, 152, 181, 0.22);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Manrope", "Segoe UI", system-ui, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(900px circle at 20% 0%, rgba(55, 202, 160, 0.14), transparent 40%),
+        radial-gradient(900px circle at 85% 5%, rgba(94, 167, 255, 0.17), transparent 45%),
+        linear-gradient(135deg, var(--bg), var(--bg2));
+      display: grid;
+      place-items: center;
+      padding: 20px;
+    }
+    .card {
+      width: min(420px, 100%);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.45);
+    }
+    h1 { margin: 0 0 6px; font-size: 22px; }
+    p { margin: 0 0 12px; color: var(--muted); font-size: 14px; }
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.06em; }
+    input {
+      width: 100%;
+      border: 1px solid var(--border);
+      background: #0c1323;
+      color: var(--ink);
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+      font-size: 14px;
+    }
+    .btn {
+      width: 100%;
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+      background: linear-gradient(120deg, var(--accent), var(--accent2));
+      color: #041015;
+    }
+    .mode-toggle {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .mode-btn {
+      border: 1px solid var(--border);
+      background: #0c1323;
+      color: var(--muted);
+      border-radius: 10px;
+      padding: 9px 10px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .mode-btn.active {
+      color: #041015;
+      border-color: transparent;
+      background: linear-gradient(120deg, var(--accent), var(--accent2));
+    }
+    .mode-btn[disabled] {
+      opacity: 0.55;
+      cursor: default;
+    }
+    .toggle {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .toggle input {
+      width: auto;
+      margin: 0;
+    }
+    .error {
+      margin: 0 0 10px;
+      border: 1px solid rgba(248, 113, 113, 0.4);
+      background: rgba(220, 38, 38, 0.14);
+      color: #fecaca;
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="{{ url_for('secure_login_route', next=next_path) }}">
+    <h1>{{ app_title }} Secure Login</h1>
+    {% if has_users %}
+    <p>Sign in or create your own private account for this device.</p>
+    {% else %}
+    <p>No account exists yet. Create the first private account.</p>
+    {% endif %}
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+    <input type="hidden" name="next" value="{{ next_path }}" />
+    <input type="hidden" name="action" id="auth_action" value="{{ mode }}" />
+    <div class="mode-toggle">
+      <button id="mode_login" class="mode-btn" type="button" {% if not has_users %}disabled{% endif %}>Sign In</button>
+      <button id="mode_signup" class="mode-btn" type="button">Sign Up</button>
+    </div>
+    <label>Username</label>
+    <input name="username" type="text" autocomplete="username" value="{{ username }}" required />
+    <label>Password</label>
+    <input id="pw" name="password" type="password" autocomplete="current-password" required />
+    <div id="confirm_wrap">
+      <label>Confirm Password</label>
+      <input id="pw2" name="confirm" type="password" autocomplete="new-password" />
+    </div>
+    <label class="toggle"><input id="show_pw" type="checkbox" /> Show password</label>
+    <button class="btn" id="submit_btn" type="submit">Enter App</button>
+  </form>
+  <script>
+    const show = document.getElementById('show_pw');
+    const pw = document.getElementById('pw');
+    const pw2 = document.getElementById('pw2');
+    const modeLogin = document.getElementById('mode_login');
+    const modeSignup = document.getElementById('mode_signup');
+    const actionInput = document.getElementById('auth_action');
+    const confirmWrap = document.getElementById('confirm_wrap');
+    const submitBtn = document.getElementById('submit_btn');
+    const hasUsers = {{ has_users|tojson }};
+    const defaultMode = {{ mode|tojson }};
+    const seenKey = 'ocreator_seen_secure_login';
+
+    function setMode(next) {
+      const mode = next === 'signup' ? 'signup' : 'login';
+      if (actionInput) actionInput.value = mode;
+      if (modeLogin) modeLogin.classList.toggle('active', mode === 'login');
+      if (modeSignup) modeSignup.classList.toggle('active', mode === 'signup');
+      if (confirmWrap) confirmWrap.style.display = mode === 'signup' ? 'block' : 'none';
+      if (pw2) {
+        pw2.required = mode === 'signup';
+      }
+      if (submitBtn) {
+        submitBtn.textContent = mode === 'signup' ? 'Create Account' : 'Enter App';
+      }
+    }
+
+    const seenBefore = localStorage.getItem(seenKey) === '1';
+    let initialMode = defaultMode === 'signup' ? 'signup' : 'login';
+    if (hasUsers && !seenBefore) {
+      initialMode = 'signup';
+    }
+    setMode(initialMode);
+    localStorage.setItem(seenKey, '1');
+
+    if (modeLogin && hasUsers) {
+      modeLogin.addEventListener('click', () => setMode('login'));
+    }
+    if (modeSignup) {
+      modeSignup.addEventListener('click', () => setMode('signup'));
+    }
+
+    if (show) {
+      show.addEventListener('change', () => {
+        const next = show.checked ? 'text' : 'password';
+        if (pw) pw.type = next;
+        if (pw2) pw2.type = next;
+      });
+    }
+  </script>
+</body>
+</html>
+"""
 
 
 TEMPLATE = r"""
@@ -1076,6 +1752,8 @@ TEMPLATE = r"""
     .layout > .panel:nth-child(2) { animation-delay: 70ms; }
     .layout > .panel:nth-child(3) { animation-delay: 140ms; }
     .layout > .panel:nth-child(4) { animation-delay: 210ms; }
+    .layout > .panel:nth-child(5) { animation-delay: 250ms; }
+    .layout .panel.security-panel { grid-column: 1 / -1; }
     @keyframes panel-rise {
       from { opacity: 0; transform: translateY(12px) scale(0.99); }
       to { opacity: 1; transform: translateY(0) scale(1); }
@@ -1112,7 +1790,7 @@ TEMPLATE = r"""
     }
     .oc-card .title { font-weight: 700; }
     .oc-card.pinned .title::before {
-      content: "Pinned • ";
+      content: "Pinned â€¢ ";
       color: var(--accent);
       font-weight: 700;
     }
@@ -1363,6 +2041,42 @@ TEMPLATE = r"""
       padding: 7px 10px;
       font-size: 12px;
     }
+    .ai-tab-toggle {
+      margin-bottom: 12px;
+    }
+    .ai-tab-content {
+      display: none;
+    }
+    .ai-tab-content.active {
+      display: block;
+    }
+    .security-users {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 10px;
+      max-height: 34vh;
+      overflow: auto;
+    }
+    .security-user-card {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+      padding: 10px;
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }
+    .security-user-card .meta {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .security-user-card .btn {
+      box-shadow: none;
+      padding: 6px 10px;
+      font-size: 12px;
+    }
     .modal {
       position: fixed;
       inset: 0;
@@ -1484,11 +2198,13 @@ TEMPLATE = r"""
     @media (max-width: 1600px) {
       .layout { grid-template-columns: 280px 1fr 300px; }
       .layout .panel.provider-panel { grid-column: 1 / -1; }
+      .layout .panel.security-panel { grid-column: 1 / -1; }
     }
     @media (max-width: 1200px) {
       .layout { grid-template-columns: 280px 1fr; }
       .layout .panel.library-panel { order: 3; }
       .layout .panel.provider-panel { order: 4; grid-column: 1 / -1; }
+      .layout .panel.security-panel { order: 5; grid-column: 1 / -1; }
     }
     @media (max-width: 980px) {
       header {
@@ -1571,6 +2287,7 @@ TEMPLATE = r"""
       .layout { grid-template-columns: 1fr; }
       .help-grid { grid-template-columns: 1fr; }
       .layout .panel.provider-panel { grid-column: auto; }
+      .layout .panel.security-panel { grid-column: auto; }
       .layout {
         padding: 12px;
         gap: 12px;
@@ -1588,7 +2305,7 @@ TEMPLATE = r"""
         bottom: 10px;
         z-index: 30;
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-columns: repeat(5, minmax(0, 1fr));
         gap: 8px;
         padding: 8px;
         border-radius: 14px;
@@ -1674,7 +2391,7 @@ TEMPLATE = r"""
     ></iframe>
   </div>
   <div id="conn_toast" class="conn-toast" aria-live="polite">
-    <span id="conn_toast_icon" class="icon">✓</span>
+    <span id="conn_toast_icon" class="icon">âœ“</span>
     <span id="conn_toast_text"></span>
   </div>
   <header>
@@ -1736,6 +2453,11 @@ TEMPLATE = r"""
         <form method="post" action="{{ url_for('create_oc_route') }}">
           <button class="btn secondary" type="submit">New OC</button>
         </form>
+        {% if security_enabled and current_username %}
+        <form method="post" action="{{ url_for('logout_route') }}">
+          <button class="btn ghost" type="submit">Logout ({{ current_username }})</button>
+        </form>
+        {% endif %}
       </div>
       <button class="btn ghost mobile-header-menu-btn" id="mobile_actions_btn" type="button" aria-expanded="false" aria-controls="mobile_actions_drawer">More</button>
     </div>
@@ -1754,66 +2476,112 @@ TEMPLATE = r"""
         <form method="post" action="{{ url_for('create_oc_route') }}">
           <button class="btn secondary" type="submit">New OC</button>
         </form>
+        {% if security_enabled and current_username %}
+        <form method="post" action="{{ url_for('logout_route') }}">
+          <button class="btn ghost" type="submit">Logout ({{ current_username }})</button>
+        </form>
+        {% endif %}
       </div>
     </div>
   </div>
 
   <nav class="mobile-switcher" id="mobile_switcher" aria-label="Mobile quick sections">
-    <button type="button" data-mobile-target="editor" aria-label="Editor panel"><span class="icon">✎</span><span class="label">Editor</span></button>
-    <button type="button" data-mobile-target="ai" aria-label="AI settings panel"><span class="icon">⚙</span><span class="label">AI</span></button>
-    <button type="button" data-mobile-target="library" aria-label="OC library panel"><span class="icon">☰</span><span class="label">Library</span></button>
-    <button type="button" data-mobile-target="vault" aria-label="Provider vault panel"><span class="icon">⌁</span><span class="label">Vault</span></button>
+    <button type="button" data-mobile-target="editor" aria-label="Editor panel"><span class="icon">&#9998;</span><span class="label">Editor</span></button>
+    <button type="button" data-mobile-target="ai" aria-label="AI settings panel"><span class="icon">&#9881;</span><span class="label">AI</span></button>
+    <button type="button" data-mobile-target="library" aria-label="OC library panel"><span class="icon">&#9776;</span><span class="label">Library</span></button>
+    <button type="button" data-mobile-target="vault" aria-label="Provider vault panel"><span class="icon">&#8993;</span><span class="label">Vault</span></button>
+    <button type="button" data-mobile-target="security" aria-label="Security panel"><span class="icon">&#128274;</span><span class="label">Secure</span></button>
   </nav>
 
   <div class="layout">
     <aside class="panel" id="panel_ai" data-panel-name="ai">
       <h3>AI Settings</h3>
-      <div class="grid">
-        <div>
-          <label>Saved Profile</label>
-          <select id="ai_profile_select" data-tip="Select a saved provider profile to quickly fill AI settings.">
-            <option value="">Manual / Current Settings</option>
-            {% for profile in provider_profiles %}
-            <option value="{{ profile.id }}">{{ profile.name or 'Unnamed Provider' }} ({{ profile.provider }})</option>
-            {% endfor %}
-          </select>
+      <div class="mode-toggle ai-tab-toggle" id="ai_tab_toggle">
+        <button type="button" data-ai-tab="provider">Provider</button>
+        <button type="button" data-ai-tab="precut">Pre-Cut</button>
+      </div>
+
+      <div class="ai-tab-content active" data-ai-tab-content="provider">
+        <div class="grid">
+          <div>
+            <label>Saved Profile</label>
+            <select id="ai_profile_select" data-tip="Select a saved provider profile to quickly fill AI settings.">
+              <option value="">Manual / Current Settings</option>
+              {% for profile in provider_profiles %}
+              <option value="{{ profile.id }}">{{ profile.name or 'Unnamed Provider' }} ({{ profile.provider }})</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label>Provider</label>
+            <select id="ai_provider" data-tip="Choose which AI provider endpoint to call for generation.">
+              {% for provider in providers %}
+              <option value="{{ provider.id }}" {% if settings.provider == provider.id %}selected{% endif %}>{{ provider.label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label>Model</label>
+            <input id="ai_model" value="{{ settings.model }}" />
+          </div>
+          <div>
+            <label>API Key</label>
+            <input id="ai_key" type="password" value="{{ settings.api_key }}" placeholder="Enter API key" />
+          </div>
+          <div>
+            <label>Base URL</label>
+            <input id="ai_base_url" value="{{ settings.base_url }}" />
+          </div>
+          <div>
+            <label>Temperature</label>
+            <input id="ai_temp" type="number" min="0" max="2" step="0.1" value="{{ settings.temperature }}" />
+          </div>
+          <div>
+            <label>Max Tokens</label>
+            <input id="ai_tokens" type="number" step="1" value="{{ settings.max_tokens }}" />
+          </div>
+          <div>
+            <button class="btn ghost" type="button" onclick="saveSettings()" data-tip="Store provider, model, key, and tuning values in your current user folder.">Save AI Settings</button>
+          </div>
+          <div>
+            <button class="btn ghost" type="button" onclick="applySelectedProfileToSettings()" data-tip="Copy the selected saved profile into the AI Settings fields.">Apply Selected Profile</button>
+          </div>
+          <div>
+            <button class="btn ghost" type="button" onclick="testConnection()" data-tip="Run a quick provider ping to confirm key/model/base URL works.">Test Connection</button>
+          </div>
         </div>
-        <div>
-          <label>Provider</label>
-          <select id="ai_provider" data-tip="Choose which AI provider endpoint to call for generation.">
-            {% for provider in providers %}
-            <option value="{{ provider.id }}" {% if settings.provider == provider.id %}selected{% endif %}>{{ provider.label }}</option>
-            {% endfor %}
-          </select>
-        </div>
-        <div>
-          <label>Model</label>
-          <input id="ai_model" value="{{ settings.model }}" />
-        </div>
-        <div>
-          <label>API Key</label>
-          <input id="ai_key" type="password" value="{{ settings.api_key }}" placeholder="Enter API key" />
-        </div>
-        <div>
-          <label>Base URL</label>
-          <input id="ai_base_url" value="{{ settings.base_url }}" />
-        </div>
-        <div>
-          <label>Temperature</label>
-          <input id="ai_temp" type="number" min="0" max="2" step="0.1" value="{{ settings.temperature }}" />
-        </div>
-        <div>
-          <label>Max Tokens</label>
-          <input id="ai_tokens" type="number" step="1" value="{{ settings.max_tokens }}" />
-        </div>
-        <div>
-          <button class="btn ghost" type="button" onclick="saveSettings()" data-tip="Store provider, model, key, and tuning values in data/settings.json.">Save AI Settings</button>
-        </div>
-        <div>
-          <button class="btn ghost" type="button" onclick="applySelectedProfileToSettings()" data-tip="Copy the selected saved profile into the AI Settings fields.">Apply Selected Profile</button>
-        </div>
-        <div>
-          <button class="btn ghost" type="button" onclick="testConnection()" data-tip="Run a quick provider ping to confirm key/model/base URL works.">Test Connection</button>
+      </div>
+
+      <div class="ai-tab-content" data-ai-tab-content="precut">
+        <div class="grid">
+          <div>
+            <label>Enable String Truncate</label>
+            <select id="ai_pre_cut_enabled">
+              <option value="false" {% if not settings.pre_cut_enabled %}selected{% endif %}>Off</option>
+              <option value="true" {% if settings.pre_cut_enabled %}selected{% endif %}>On</option>
+            </select>
+          </div>
+          <div style="grid-column: 1 / -1;">
+            <label>Truncate From These Phrases (one per line)</label>
+            <textarea id="ai_pre_cut_markers" placeholder="Want the best AI models?&#10;Sponsored">{{ settings.pre_cut_markers }}</textarea>
+          </div>
+          <div style="grid-column: 1 / -1;">
+            <div class="hint">If any phrase appears in a response, text is cut from that phrase onward.</div>
+          </div>
+          <div>
+            <label>Enable Word Replacer</label>
+            <select id="ai_pre_cut_replace_enabled">
+              <option value="false" {% if not settings.pre_cut_replace_enabled %}selected{% endif %}>Off</option>
+              <option value="true" {% if settings.pre_cut_replace_enabled %}selected{% endif %}>On</option>
+            </select>
+          </div>
+          <div style="grid-column: 1 / -1;">
+            <label>Replacement Rules (one per line)</label>
+            <textarea id="ai_pre_cut_replace_rules" placeholder="bad phrase => better phrase&#10;unfavorable => neutral">{{ settings.pre_cut_replace_rules }}</textarea>
+          </div>
+          <div>
+            <button class="btn ghost" type="button" onclick="saveSettings()">Save Pre-Cut Settings</button>
+          </div>
         </div>
       </div>
 
@@ -1902,7 +2670,7 @@ TEMPLATE = r"""
             <div class="meta">{{ item.updated_at or 'New' }}</div>
           </a>
           <div class="oc-menu-wrap">
-            <button class="oc-menu-btn" type="button" title="OC actions" data-menu-trigger aria-label="Open OC menu">☰</button>
+            <button class="oc-menu-btn" type="button" title="OC actions" data-menu-trigger aria-label="Open OC menu">â˜°</button>
             <div class="oc-menu" data-menu>
               <button type="button" data-action="duplicate">Duplicate</button>
               <button type="button" data-action="pin">{% if item.pinned %}Unpin{% else %}Pin{% endif %}</button>
@@ -1942,7 +2710,7 @@ TEMPLATE = r"""
         </div>
         <div>
           <label>API Key</label>
-          <input id="vault_key" type="password" placeholder="Stored in data/providers.json" />
+          <input id="vault_key" type="password" placeholder="Stored in your user folder" />
         </div>
         <div>
           <label>Notes</label>
@@ -1953,13 +2721,13 @@ TEMPLATE = r"""
         <button class="btn ghost" type="button" onclick="saveProviderProfile()" data-tip="Save these provider credentials/details in the local vault.">Save Profile</button>
         <button class="btn ghost" type="button" onclick="clearProviderForm()">Clear</button>
       </div>
-      <div class="hint" id="provider_status" style="margin-top: 8px;">Profiles are saved to data/providers.json.</div>
+      <div class="hint" id="provider_status" style="margin-top: 8px;">Profiles are saved in your current user folder.</div>
       <div class="provider-list" id="provider_list">
         {% for profile in provider_profiles %}
         <div class="provider-card" data-profile-id="{{ profile.id }}">
           <div>
             <strong>{{ profile.name or 'Unnamed Provider' }}</strong>
-            <div class="meta">{{ profile.provider }}{% if profile.model %} • {{ profile.model }}{% endif %}</div>
+            <div class="meta">{{ profile.provider }}{% if profile.model %} &bull; {{ profile.model }}{% endif %}</div>
           </div>
           <div class="provider-row">
             <button class="btn ghost" type="button" onclick="useProviderProfile('{{ profile.id }}')" data-tip="Load this profile into AI Settings.">Use</button>
@@ -1968,6 +2736,38 @@ TEMPLATE = r"""
           </div>
         </div>
         {% endfor %}
+      </div>
+    </aside>
+
+    <aside class="panel security-panel" id="panel_security" data-panel-name="security">
+      <h3>Secure Login</h3>
+      <div class="grid">
+        <div>
+          <label>Enable Secure Login</label>
+          <select id="security_enabled">
+            <option value="false" {% if not security_enabled %}selected{% endif %}>Off</option>
+            <option value="true" {% if security_enabled %}selected{% endif %}>On</option>
+          </select>
+        </div>
+        <div>
+          <label>Active User</label>
+          <input id="security_current_user" value="{{ current_username or 'Not signed in' }}" readonly />
+        </div>
+        <div>
+          <label>New Password (Current User)</label>
+          <input id="security_password" type="password" placeholder="At least 8 characters" />
+        </div>
+      </div>
+      <div class="row" style="margin-top: 10px;">
+        <button class="btn ghost" type="button" onclick="saveSecurityPassword()">Update My Password</button>
+        <button class="btn ghost" type="button" onclick="saveSecurityConfig()">Apply Security Toggle</button>
+        <button class="btn ghost" type="button" onclick="refreshSecurityStatus()">Refresh</button>
+      </div>
+      <div class="hint" id="security_status" style="margin-top: 8px;">
+        Secure login is {% if security_enabled %}enabled{% else %}disabled{% endif %}. Accounts are private and not listed to other users.
+      </div>
+      <div class="hint" style="margin-top: 4px;">
+        New devices are prompted to Sign In or Sign Up here: <a href="{{ url_for('secure_login_route') }}" style="color: var(--accent-2);" target="_self">Open Secure Login</a>
       </div>
     </aside>
   </div>
@@ -2062,6 +2862,11 @@ TEMPLATE = r"""
     const statusProgressEl = document.getElementById('status_progress');
     const statusSaveEl = document.getElementById('status_save');
     const aiProfileSelectEl = document.getElementById('ai_profile_select');
+    const aiTabToggleEl = document.getElementById('ai_tab_toggle');
+    const preCutEnabledEl = document.getElementById('ai_pre_cut_enabled');
+    const preCutMarkersEl = document.getElementById('ai_pre_cut_markers');
+    const preCutReplaceEnabledEl = document.getElementById('ai_pre_cut_replace_enabled');
+    const preCutReplaceRulesEl = document.getElementById('ai_pre_cut_replace_rules');
     const helpModalEl = document.getElementById('help_modal');
     const helpModeToggleEl = document.getElementById('help_mode_toggle');
     const helpModelEl = document.getElementById('help_model');
@@ -2097,14 +2902,21 @@ TEMPLATE = r"""
     const onboardNextBtnEl = document.getElementById('onboard_next_btn');
     const onboardBackBtnEl = document.getElementById('onboard_back_btn');
     const providerStatusEl = document.getElementById('provider_status');
+    const securityEnabledEl = document.getElementById('security_enabled');
+    const securityCurrentUserEl = document.getElementById('security_current_user');
+    const securityPasswordEl = document.getElementById('security_password');
+    const securityStatusEl = document.getElementById('security_status');
     const providerDefaults = {{ provider_defaults|tojson }};
     const providerProfiles = {{ provider_profiles|tojson }};
+    const initialSecurityEnabled = {{ security_enabled|tojson }};
+    const initialCurrentUsername = {{ current_username|tojson }};
 
     const HELP_HISTORY_KEY = 'ocreator_help_history';
     const HELP_MODE_KEY = 'ocreator_help_mode';
     const HELP_MODEL_KEY = 'ocreator_help_model';
     const EFFECTS_ENABLED_KEY = 'ocreator_effects_enabled';
     const MOBILE_PANEL_KEY = 'ocreator_mobile_panel';
+    const AI_TAB_KEY = 'ocreator_ai_tab';
 
     let activeThemeName = 'system';
     let confirmResolver = null;
@@ -2138,6 +2950,28 @@ TEMPLATE = r"""
     function initMode() {
       const current = "{{ oc.mode }}" || localStorage.getItem('ocreator_mode') || 'scratch';
       setMode(current);
+    }
+
+    function setAITab(name) {
+      const next = name === 'precut' ? 'precut' : 'provider';
+      document.querySelectorAll('[data-ai-tab-content]').forEach((panel) => {
+        panel.classList.toggle('active', panel.dataset.aiTabContent === next);
+      });
+      if (aiTabToggleEl) {
+        aiTabToggleEl.querySelectorAll('button[data-ai-tab]').forEach((btn) => {
+          btn.classList.toggle('active', btn.dataset.aiTab === next);
+        });
+      }
+      localStorage.setItem(AI_TAB_KEY, next);
+    }
+
+    function initAITabs() {
+      if (!aiTabToggleEl) return;
+      const saved = localStorage.getItem(AI_TAB_KEY) || 'provider';
+      setAITab(saved);
+      aiTabToggleEl.querySelectorAll('button[data-ai-tab]').forEach((btn) => {
+        btn.addEventListener('click', () => setAITab(btn.dataset.aiTab || 'provider'));
+      });
     }
 
     function setMobilePanel(name) {
@@ -2256,9 +3090,17 @@ TEMPLATE = r"""
         base_url: document.getElementById('ai_base_url').value,
         temperature: parseFloat(document.getElementById('ai_temp').value || '0.7'),
         max_tokens: parseInt(document.getElementById('ai_tokens').value || '1200', 10),
+        pre_cut_enabled: preCutEnabledEl ? preCutEnabledEl.value === 'true' : false,
+        pre_cut_markers: preCutMarkersEl ? preCutMarkersEl.value : '',
+        pre_cut_replace_enabled: preCutReplaceEnabledEl ? preCutReplaceEnabledEl.value === 'true' : false,
+        pre_cut_replace_rules: preCutReplaceRulesEl ? preCutReplaceRulesEl.value : '',
       });
       document.getElementById('ai_temp').value = String(payload.temperature);
       document.getElementById('ai_tokens').value = String(payload.max_tokens);
+      if (preCutEnabledEl) preCutEnabledEl.value = payload.pre_cut_enabled ? 'true' : 'false';
+      if (preCutMarkersEl) preCutMarkersEl.value = payload.pre_cut_markers || '';
+      if (preCutReplaceEnabledEl) preCutReplaceEnabledEl.value = payload.pre_cut_replace_enabled ? 'true' : 'false';
+      if (preCutReplaceRulesEl) preCutReplaceRulesEl.value = payload.pre_cut_replace_rules || '';
       const res = await fetch('/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2272,6 +3114,10 @@ TEMPLATE = r"""
       if (data.settings) {
         document.getElementById('ai_temp').value = String(data.settings.temperature);
         document.getElementById('ai_tokens').value = String(data.settings.max_tokens);
+        if (preCutEnabledEl) preCutEnabledEl.value = data.settings.pre_cut_enabled ? 'true' : 'false';
+        if (preCutMarkersEl) preCutMarkersEl.value = data.settings.pre_cut_markers || '';
+        if (preCutReplaceEnabledEl) preCutReplaceEnabledEl.value = data.settings.pre_cut_replace_enabled ? 'true' : 'false';
+        if (preCutReplaceRulesEl) preCutReplaceRulesEl.value = data.settings.pre_cut_replace_rules || '';
       }
       setStatus('Settings saved.');
     }
@@ -2281,6 +3127,10 @@ TEMPLATE = r"""
       const temp = Number.isFinite(safe.temperature) ? safe.temperature : 0.7;
       safe.temperature = Math.max(0, Math.min(2, temp));
       safe.max_tokens = Number.isFinite(safe.max_tokens) ? Math.round(safe.max_tokens) : 1200;
+      safe.pre_cut_enabled = Boolean(safe.pre_cut_enabled);
+      safe.pre_cut_replace_enabled = Boolean(safe.pre_cut_replace_enabled);
+      safe.pre_cut_markers = String(safe.pre_cut_markers || '').slice(0, 12000);
+      safe.pre_cut_replace_rules = String(safe.pre_cut_replace_rules || '').slice(0, 12000);
       return safe;
     }
 
@@ -2334,7 +3184,7 @@ TEMPLATE = r"""
       if (!connToastEl || !connToastTextEl || !connToastIconEl) return;
       connToastEl.classList.remove('ok', 'err');
       connToastEl.classList.add(ok ? 'ok' : 'err');
-      connToastIconEl.textContent = ok ? '✓' : '✕';
+      connToastIconEl.textContent = ok ? 'âœ“' : 'âœ•';
       connToastTextEl.textContent = text || (ok ? 'Connection OK' : 'Connection failed');
       connToastEl.classList.add('show');
       if (connToastTimer) {
@@ -2445,6 +3295,79 @@ TEMPLATE = r"""
       window.location.reload();
     }
 
+    function setSecurityStatus(text) {
+      if (securityStatusEl) securityStatusEl.textContent = text;
+    }
+
+    async function refreshSecurityStatus() {
+      if (!securityEnabledEl) return;
+      const res = await fetch('/security/status');
+      const data = await res.json();
+      if (!res.ok) {
+        setSecurityStatus(data.error || 'Failed to read security status.');
+        return;
+      }
+      securityEnabledEl.value = data.enabled ? 'true' : 'false';
+      if (securityCurrentUserEl) {
+        securityCurrentUserEl.value = data.current_user || 'Not signed in';
+      }
+      setSecurityStatus(data.enabled ? 'Secure login is enabled.' : 'Secure login is disabled.');
+    }
+
+    async function saveSecurityConfig() {
+      if (!securityEnabledEl) return;
+      const enabled = securityEnabledEl.value === 'true';
+      const res = await fetch('/security/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setSecurityStatus(data.error || 'Failed to update security toggle.');
+        return;
+      }
+      setSecurityStatus(data.enabled ? 'Secure login enabled.' : 'Secure login disabled.');
+      if (!data.enabled && securityCurrentUserEl) {
+        securityCurrentUserEl.value = 'Not signed in';
+      }
+    }
+
+    async function saveSecurityPassword() {
+      if (!securityPasswordEl) return;
+      const password = securityPasswordEl.value;
+      if (!password) {
+        setSecurityStatus('Enter a new password first.');
+        return;
+      }
+      const res = await fetch('/security/users/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setSecurityStatus(data.error || 'Failed to update password.');
+        return;
+      }
+      securityPasswordEl.value = '';
+      setSecurityStatus('Password updated for current user.');
+      await refreshSecurityStatus();
+    }
+
+    function initSecurityPanel() {
+      if (!securityEnabledEl) return;
+      securityEnabledEl.value = initialSecurityEnabled ? 'true' : 'false';
+      if (securityCurrentUserEl) {
+        securityCurrentUserEl.value = initialCurrentUsername || 'Not signed in';
+      }
+      if (securityEnabledEl) {
+        securityEnabledEl.addEventListener('change', () => {
+          setSecurityStatus(`Security toggle set to ${securityEnabledEl.value === 'true' ? 'On' : 'Off'}. Click Apply Security Toggle to save.`);
+        });
+      }
+    }
+
     async function duplicateOC(ocId) {
       const res = await fetch(`/oc/${ocId}/duplicate`, { method: 'POST' });
       const data = await res.json();
@@ -2545,7 +3468,7 @@ TEMPLATE = r"""
       if (data.name) {
         document.getElementById('oc_name').value = data.name;
       }
-      setStatus('Done.');
+      setStatus(data.filtered ? 'Done. String filter applied.' : 'Done.');
     }
 
     async function quickFixOC() {
@@ -2558,7 +3481,7 @@ TEMPLATE = r"""
         return;
       }
       document.getElementById('oc_result').value = data.result || '';
-      setStatus('Quick fix complete.');
+      setStatus(data.filtered ? 'Quick fix complete (string filter applied).' : 'Quick fix complete.');
     }
 
     function applyResult() {
@@ -2936,6 +3859,7 @@ TEMPLATE = r"""
     }
 
     initMode();
+    initAITabs();
     initMobileActions();
     initMobilePanels();
     initTemplate();
@@ -2945,7 +3869,9 @@ TEMPLATE = r"""
     initProviderVault();
     initHelpMode();
     initHelpModel();
+    initSecurityPanel();
     initOCMenus();
+    refreshSecurityStatus();
     loadHelpHistory();
     renderOnboardStep(0);
     startAutosave();
@@ -2963,3 +3889,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
