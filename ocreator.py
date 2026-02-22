@@ -874,6 +874,7 @@ def security_status_route():
             "ok": True,
             "enabled": security_enabled(),
             "current_user": str(current.get("username", "") if current else ""),
+            "current_user_id": str(current.get("id", "") if current else ""),
         }
     )
 
@@ -943,6 +944,7 @@ def edit_oc(oc_id: str):
         default_template=DEFAULT_TEMPLATE,
         security_enabled=security_enabled(),
         current_username=str(current_user.get("username", "") if current_user else ""),
+        current_user_id=str(current_user.get("id", "") if current_user else ""),
     )
 
 
@@ -1833,7 +1835,7 @@ TEMPLATE = r"""
     }
     .oc-card .title { font-weight: 700; }
     .oc-card.pinned .title::before {
-      content: "Pinned â€¢ ";
+      content: "Pinned \2022 ";
       color: var(--accent);
       font-weight: 700;
     }
@@ -2434,7 +2436,7 @@ TEMPLATE = r"""
     ></iframe>
   </div>
   <div id="conn_toast" class="conn-toast" aria-live="polite">
-    <span id="conn_toast_icon" class="icon">âœ“</span>
+    <span id="conn_toast_icon" class="icon">&#10003;</span>
     <span id="conn_toast_text"></span>
   </div>
   <header>
@@ -2713,7 +2715,7 @@ TEMPLATE = r"""
             <div class="meta">{{ item.updated_at or 'New' }}</div>
           </a>
           <div class="oc-menu-wrap">
-            <button class="oc-menu-btn" type="button" title="OC actions" data-menu-trigger aria-label="Open OC menu">â˜°</button>
+            <button class="oc-menu-btn" type="button" title="OC actions" data-menu-trigger aria-label="Open OC menu">&#9776;</button>
             <div class="oc-menu" data-menu>
               <button type="button" data-action="duplicate">Duplicate</button>
               <button type="button" data-action="pin">{% if item.pinned %}Unpin{% else %}Pin{% endif %}</button>
@@ -2786,11 +2788,8 @@ TEMPLATE = r"""
       <h3>Secure Login</h3>
       <div class="grid">
         <div>
-          <label>Enable Secure Login</label>
-          <select id="security_enabled">
-            <option value="false" {% if not security_enabled %}selected{% endif %}>Off</option>
-            <option value="true" {% if security_enabled %}selected{% endif %}>On</option>
-          </select>
+          <label>User Unique ID</label>
+          <input id="security_user_id" value="{{ current_user_id or 'Not signed in' }}" readonly />
         </div>
         <div>
           <label>Active User</label>
@@ -2803,11 +2802,10 @@ TEMPLATE = r"""
       </div>
       <div class="row" style="margin-top: 10px;">
         <button class="btn ghost" type="button" onclick="saveSecurityPassword()">Update My Password</button>
-        <button class="btn ghost" type="button" onclick="saveSecurityConfig()">Apply Security Toggle</button>
         <button class="btn ghost" type="button" onclick="refreshSecurityStatus()">Refresh</button>
       </div>
       <div class="hint" id="security_status" style="margin-top: 8px;">
-        Secure login is {% if security_enabled %}enabled{% else %}disabled{% endif %}. Accounts are private and not listed to other users.
+        This unique ID is tied to your folder under <code>data/users/</code>.
       </div>
       <div class="hint" style="margin-top: 4px;">
         New devices are prompted to Sign In or Sign Up here: <a href="{{ url_for('secure_login_route') }}" style="color: var(--accent-2);" target="_self">Open Secure Login</a>
@@ -2945,13 +2943,13 @@ TEMPLATE = r"""
     const onboardNextBtnEl = document.getElementById('onboard_next_btn');
     const onboardBackBtnEl = document.getElementById('onboard_back_btn');
     const providerStatusEl = document.getElementById('provider_status');
-    const securityEnabledEl = document.getElementById('security_enabled');
+    const securityUserIdEl = document.getElementById('security_user_id');
     const securityCurrentUserEl = document.getElementById('security_current_user');
     const securityPasswordEl = document.getElementById('security_password');
     const securityStatusEl = document.getElementById('security_status');
     const providerDefaults = {{ provider_defaults|tojson }};
     const providerProfiles = {{ provider_profiles|tojson }};
-    const initialSecurityEnabled = {{ security_enabled|tojson }};
+    const initialCurrentUserId = {{ current_user_id|tojson }};
     const initialCurrentUsername = {{ current_username|tojson }};
 
     const HELP_HISTORY_KEY = 'ocreator_help_history';
@@ -3227,7 +3225,7 @@ TEMPLATE = r"""
       if (!connToastEl || !connToastTextEl || !connToastIconEl) return;
       connToastEl.classList.remove('ok', 'err');
       connToastEl.classList.add(ok ? 'ok' : 'err');
-      connToastIconEl.textContent = ok ? 'âœ“' : 'âœ•';
+      connToastIconEl.textContent = ok ? '\u2713' : '\u2715';
       connToastTextEl.textContent = text || (ok ? 'Connection OK' : 'Connection failed');
       connToastEl.classList.add('show');
       if (connToastTimer) {
@@ -3343,37 +3341,20 @@ TEMPLATE = r"""
     }
 
     async function refreshSecurityStatus() {
-      if (!securityEnabledEl) return;
+      if (!securityCurrentUserEl && !securityUserIdEl) return;
       const res = await fetch('/security/status');
       const data = await res.json();
       if (!res.ok) {
         setSecurityStatus(data.error || 'Failed to read security status.');
         return;
       }
-      securityEnabledEl.value = data.enabled ? 'true' : 'false';
       if (securityCurrentUserEl) {
         securityCurrentUserEl.value = data.current_user || 'Not signed in';
       }
-      setSecurityStatus(data.enabled ? 'Secure login is enabled.' : 'Secure login is disabled.');
-    }
-
-    async function saveSecurityConfig() {
-      if (!securityEnabledEl) return;
-      const enabled = securityEnabledEl.value === 'true';
-      const res = await fetch('/security/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setSecurityStatus(data.error || 'Failed to update security toggle.');
-        return;
+      if (securityUserIdEl) {
+        securityUserIdEl.value = data.current_user_id || 'Not signed in';
       }
-      setSecurityStatus(data.enabled ? 'Secure login enabled.' : 'Secure login disabled.');
-      if (!data.enabled && securityCurrentUserEl) {
-        securityCurrentUserEl.value = 'Not signed in';
-      }
+      setSecurityStatus('User ID is tied to your directory under data/users/.');
     }
 
     async function saveSecurityPassword() {
@@ -3399,15 +3380,12 @@ TEMPLATE = r"""
     }
 
     function initSecurityPanel() {
-      if (!securityEnabledEl) return;
-      securityEnabledEl.value = initialSecurityEnabled ? 'true' : 'false';
+      if (!securityCurrentUserEl && !securityUserIdEl) return;
       if (securityCurrentUserEl) {
         securityCurrentUserEl.value = initialCurrentUsername || 'Not signed in';
       }
-      if (securityEnabledEl) {
-        securityEnabledEl.addEventListener('change', () => {
-          setSecurityStatus(`Security toggle set to ${securityEnabledEl.value === 'true' ? 'On' : 'Off'}. Click Apply Security Toggle to save.`);
-        });
+      if (securityUserIdEl) {
+        securityUserIdEl.value = initialCurrentUserId || 'Not signed in';
       }
     }
 
