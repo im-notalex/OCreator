@@ -1,3 +1,4 @@
+import subprocess
 import json
 import os
 import secrets
@@ -3900,7 +3901,8 @@ TEMPLATE = r"""
 </body>
 </html>
 """
-
+print("Processing complete. Fetching network info...")
+subprocess.run(["get_ip.bat"])
 
 def main() -> None:
     ensure_dirs()
@@ -3910,4 +3912,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
