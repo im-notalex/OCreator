@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ app_title }} - Secure Login</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #081018;
+      --bg2: #0e1724;
+      --card: rgba(16, 24, 38, 0.94);
+      --ink: #f5f7fb;
+      --muted: #97a3b6;
+      --accent: #37caa0;
+      --accent2: #5ea7ff;
+      --border: rgba(132, 152, 181, 0.22);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Manrope", "Segoe UI", system-ui, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(900px circle at 20% 0%, rgba(55, 202, 160, 0.14), transparent 40%),
+        radial-gradient(900px circle at 85% 5%, rgba(94, 167, 255, 0.17), transparent 45%),
+        linear-gradient(135deg, var(--bg), var(--bg2));
+      display: grid;
+      place-items: center;
+      padding: 20px;
+    }
+    .card {
+      width: min(420px, 100%);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.45);
+    }
+    h1 { margin: 0 0 6px; font-size: 22px; }
+    p { margin: 0 0 12px; color: var(--muted); font-size: 14px; }
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.06em; }
+    input {
+      width: 100%;
+      border: 1px solid var(--border);
+      background: #0c1323;
+      color: var(--ink);
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+      font-size: 14px;
+    }
+    .btn {
+      width: 100%;
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+      background: linear-gradient(120deg, var(--accent), var(--accent2));
+      color: #041015;
+    }
+    .mode-toggle {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .mode-btn {
+      border: 1px solid var(--border);
+      background: #0c1323;
+      color: var(--muted);
+      border-radius: 10px;
+      padding: 9px 10px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .mode-btn.active {
+      color: #041015;
+      border-color: transparent;
+      background: linear-gradient(120deg, var(--accent), var(--accent2));
+    }
+    .mode-btn[disabled] {
+      opacity: 0.55;
+      cursor: default;
+    }
+    .toggle {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .toggle input {
+      width: auto;
+      margin: 0;
+    }
+    .error {
+      margin: 0 0 10px;
+      border: 1px solid rgba(248, 113, 113, 0.4);
+      background: rgba(220, 38, 38, 0.14);
+      color: #fecaca;
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="{{ url_for('secure_login_route', next=next_path) }}">
+    <h1>{{ app_title }} Secure Login</h1>
+    {% if has_users %}
+    <p>Sign in or create your own private account for this device.</p>
+    {% else %}
+    <p>No account exists yet. Create the first private account.</p>
+    {% endif %}
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+    <input type="hidden" name="next" value="{{ next_path }}" />
+    <input type="hidden" name="action" id="auth_action" value="{{ mode }}" />
+    <div class="mode-toggle">
+      <button id="mode_login" class="mode-btn" type="button" {% if not has_users %}disabled{% endif %}>Sign In</button>
+      <button id="mode_signup" class="mode-btn" type="button">Sign Up</button>
+    </div>
+    <label>Username</label>
+    <input name="username" type="text" autocomplete="username" value="{{ username }}" required />
+    <label>Password</label>
+    <input id="pw" name="password" type="password" autocomplete="current-password" required />
+    <div id="confirm_wrap">
+      <label>Confirm Password</label>
+      <input id="pw2" name="confirm" type="password" autocomplete="new-password" />
+    </div>
+    <label class="toggle"><input id="show_pw" type="checkbox" /> Show password</label>
+    <button class="btn" id="submit_btn" type="submit">Enter App</button>
+  </form>
+  <script>
+    const show = document.getElementById('show_pw');
+    const pw = document.getElementById('pw');
+    const pw2 = document.getElementById('pw2');
+    const modeLogin = document.getElementById('mode_login');
+    const modeSignup = document.getElementById('mode_signup');
+    const actionInput = document.getElementById('auth_action');
+    const confirmWrap = document.getElementById('confirm_wrap');
+    const submitBtn = document.getElementById('submit_btn');
+    const hasUsers = {{ has_users|tojson }};
+    const defaultMode = {{ mode|tojson }};
+    const seenKey = 'ocreator_seen_secure_login';
+
+    function setMode(next) {
+      const mode = next === 'signup' ? 'signup' : 'login';
+      if (actionInput) actionInput.value = mode;
+      if (modeLogin) modeLogin.classList.toggle('active', mode === 'login');
+      if (modeSignup) modeSignup.classList.toggle('active', mode === 'signup');
+      if (confirmWrap) confirmWrap.style.display = mode === 'signup' ? 'block' : 'none';
+      if (pw2) {
+        pw2.required = mode === 'signup';
+      }
+      if (submitBtn) {
+        submitBtn.textContent = mode === 'signup' ? 'Create Account' : 'Enter App';
+      }
+    }
+
+    const seenBefore = localStorage.getItem(seenKey) === '1';
+    let initialMode = defaultMode === 'signup' ? 'signup' : 'login';
+    if (hasUsers && !seenBefore) {
+      initialMode = 'signup';
+    }
+    setMode(initialMode);
+    localStorage.setItem(seenKey, '1');
+
+    if (modeLogin && hasUsers) {
+      modeLogin.addEventListener('click', () => setMode('login'));
+    }
+    if (modeSignup) {
+      modeSignup.addEventListener('click', () => setMode('signup'));
+    }
+
+    if (show) {
+      show.addEventListener('change', () => {
+        const next = show.checked ? 'text' : 'password';
+        if (pw) pw.type = next;
+        if (pw2) pw2.type = next;
+      });
+    }
+  </script>
+</body>
+</html>
+
